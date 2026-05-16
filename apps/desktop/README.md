@@ -28,17 +28,17 @@ Hermes Desktop's baseline installer dependencies are:
 
 - **Python 3.11+** — for the agent runtime, dashboard backend, and tool execution.
 - **Node.js LTS** — for browser tools and Node-backed capabilities.
+- **Git for Windows** — for Git Bash, which powers Hermes terminal commands on Windows.
 
-The packaged Windows installer (`Hermes-*.exe`) is intentionally barebones: it installs the GUI and offers to install Python 3.11 + Node.js via `winget` when possible. On first launch, the GUI handles the Hermes-specific work: syncing the bundled agent payload, creating the virtualenv, installing Python dependencies, and showing progress in the onboarding UI. The MSI installer does not run the prerequisite page, so enterprise deploys should preinstall Python and Node.js out-of-band.
+The packaged Windows installer (`Hermes-*.exe`) is intentionally barebones: it installs the GUI and offers to install Python 3.11, Node.js, and Git for Windows via `winget` when possible. On first launch, the GUI handles the Hermes-specific work: syncing the bundled agent payload, creating the virtualenv, installing Python dependencies, and showing progress in the onboarding UI. The MSI installer does not run the prerequisite page, so enterprise deploys should preinstall these dependencies out-of-band.
 
 For dev (`npm run dev`) the Python check happens at first launch via the Electron bootstrapper. Manual install commands you can run yourself:
 
 ```powershell
 winget install -e --id Python.Python.3.11 --scope user
 winget install -e --id OpenJS.NodeJS.LTS
+winget install -e --id Git.Git
 ```
-
-Git for Windows is still needed for Hermes' terminal tool on Windows, but it is no longer part of the baseline GUI installer path.
 
 ## Development
 
