@@ -128,7 +128,7 @@ export const findStableBoundary = (text: string) => {
   return -1
 }
 
-export const StreamingMd = memo(function StreamingMd({ compact, msgId, t, text }: StreamingMdProps) {
+export const StreamingMd = memo(function StreamingMd({ cols, compact, msgId, t, text }: StreamingMdProps) {
   const stablePrefixRef = useRef('')
 
   // Reset if the text no longer starts with our recorded prefix (defensive;
@@ -158,22 +158,23 @@ export const StreamingMd = memo(function StreamingMd({ compact, msgId, t, text }
   const SUFFIX_BLOCK_OFFSET = 1_000_000
 
   if (!stablePrefix) {
-    return <Md compact={compact} msgId={msgId} t={t} text={unstableSuffix} />
+    return <Md cols={cols} compact={compact} msgId={msgId} t={t} text={unstableSuffix} />
   }
 
   if (!unstableSuffix) {
-    return <Md compact={compact} msgId={msgId} t={t} text={stablePrefix} />
+    return <Md cols={cols} compact={compact} msgId={msgId} t={t} text={stablePrefix} />
   }
 
   return (
     <Box flexDirection="column">
-      <Md compact={compact} msgId={msgId} t={t} text={stablePrefix} />
-      <Md blockIndexBase={SUFFIX_BLOCK_OFFSET} compact={compact} msgId={msgId} t={t} text={unstableSuffix} />
+      <Md cols={cols} compact={compact} msgId={msgId} t={t} text={stablePrefix} />
+      <Md blockIndexBase={SUFFIX_BLOCK_OFFSET} cols={cols} compact={compact} msgId={msgId} t={t} text={unstableSuffix} />
     </Box>
   )
 })
 
 interface StreamingMdProps {
+  cols?: number
   compact?: boolean
   /** Message id this stream belongs to. Threaded into both Md subtrees so
    * the prefix and suffix blocks register under the same msgId in the

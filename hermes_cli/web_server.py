@@ -56,10 +56,22 @@ try:
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
-    raise SystemExit(
-        "Web UI requires fastapi and uvicorn.\n"
-        f"Install with: {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'"
-    )
+    # First try lazy-installing the dashboard extras. Only the user actually
+    # running `hermes dashboard` needs fastapi+uvicorn; lazy install keeps
+    # them out of every other install path. After install, re-import.
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("tool.dashboard", prompt=False)
+        from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+        from fastapi.middleware.cors import CORSMiddleware
+        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+        from fastapi.staticfiles import StaticFiles
+        from pydantic import BaseModel
+    except Exception:
+        raise SystemExit(
+            "Web UI requires fastapi and uvicorn.\n"
+            f"Install with: {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'"
+        )
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
@@ -273,7 +285,9 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "stt.provider": {
         "type": "select",
         "description": "Speech-to-text provider",
-        "options": ["local", "openai", "mistral"],
+        # "mistral" temporarily removed — mistralai PyPI package quarantined
+        # (malicious 2.4.6 release on 2026-05-12). Restore once available.
+        "options": ["local", "openai"],
     },
     "display.skin": {
         "type": "select",
@@ -980,39 +994,9 @@ def get_model_options():
     can share the same types.
     """
     try:
-        from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.inventory import build_models_payload, load_picker_context
 
-        cfg = load_config()
-        model_cfg = cfg.get("model", {})
-        if isinstance(model_cfg, dict):
-            current_model = model_cfg.get("default", model_cfg.get("name", "")) or ""
-            current_provider = model_cfg.get("provider", "") or ""
-            current_base_url = model_cfg.get("base_url", "") or ""
-        else:
-            current_model = str(model_cfg) if model_cfg else ""
-            current_provider = ""
-            current_base_url = ""
-
-        user_providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
-        custom_providers = (
-            cfg.get("custom_providers")
-            if isinstance(cfg.get("custom_providers"), list)
-            else []
-        )
-
-        providers = list_authenticated_providers(
-            current_provider=current_provider,
-            current_base_url=current_base_url,
-            current_model=current_model,
-            user_providers=user_providers,
-            custom_providers=custom_providers,
-            max_models=50,
-        )
-        return {
-            "providers": providers,
-            "model": current_model,
-            "provider": current_provider,
-        }
+        return build_models_payload(load_picker_context(), max_models=50)
     except Exception:
         _log.exception("GET /api/model/options failed")
         raise HTTPException(status_code=500, detail="Failed to list model options")
@@ -1304,9 +1288,15 @@ def _truncate_token(value: Optional[str], visible: int = 6) -> str:
     OAuth access token. JWT prefixes (the part before the first dot) are
     stripped first when present so the visible suffix is always part of
     the signing region rather than a meaningless header chunk.
+
+    Returns the Entra-ID placeholder when handed a callable (Azure Foundry
+    bearer provider) — the callable is NEVER invoked here.
     """
     if not value:
         return ""
+    if callable(value) and not isinstance(value, str):
+        # Entra ID bearer provider — never reveal a minted token in the UI.
+        return "<entra-id-bearer>"
     s = str(value)
     if "." in s and s.count(".") >= 2:
         # Looks like a JWT — show the trailing piece of the signature only.
@@ -1456,7 +1446,12 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
     {
         "id": "minimax-oauth",
         "name": "MiniMax (OAuth)",
-        "flow": "pkce",
+        # MiniMax's flow is structurally device-code (verification URI +
+        # user code, backend polls the token endpoint) with a PKCE
+        # extension for code-binding. The dashboard renders the same UX
+        # as Nous's device-code flow; the PKCE bit is a security
+        # extension that doesn't change the operator experience.
+        "flow": "device_code",
         "cli_command": "hermes auth add minimax-oauth",
         "docs_url": "https://www.minimax.io",
         "status_fn": None,  # dispatched via auth.get_minimax_oauth_auth_status
@@ -1819,14 +1814,18 @@ def _submit_anthropic_pkce(session_id: str, code_input: str) -> Dict[str, Any]:
 
 
 async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
-    """Initiate a device-code flow (Nous or OpenAI Codex).
+    """Initiate a device-code flow (Nous, OpenAI Codex, or MiniMax).
 
     Calls the provider's device-auth endpoint via the existing CLI helpers,
     then spawns a background poller. Returns the user-facing display fields
     so the UI can render the verification page link + user code.
     """
     if provider_id == "nous":
-        from hermes_cli.auth import _request_device_code, PROVIDER_REGISTRY
+        from hermes_cli.auth import (
+            _nous_device_scope_with_env_override,
+            _request_nous_device_code_with_scope_fallback,
+            PROVIDER_REGISTRY,
+        )
         import httpx
         pconfig = PROVIDER_REGISTRY["nous"]
         portal_base_url = (
@@ -1835,22 +1834,34 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
             or pconfig.portal_base_url
         ).rstrip("/")
         client_id = pconfig.client_id
-        scope = pconfig.scope
+        scope, explicit_scope = _nous_device_scope_with_env_override(
+            None,
+            default_scope=pconfig.scope,
+        )
+
         def _do_nous_device_request():
-            with httpx.Client(timeout=httpx.Timeout(15.0), headers={"Accept": "application/json"}) as client:
-                return _request_device_code(
+            with httpx.Client(
+                timeout=httpx.Timeout(15.0),
+                headers={"Accept": "application/json"},
+            ) as client:
+                return _request_nous_device_code_with_scope_fallback(
                     client=client,
                     portal_base_url=portal_base_url,
                     client_id=client_id,
                     scope=scope,
+                    allow_legacy_fallback=not explicit_scope,
                 )
-        device_data = await asyncio.get_running_loop().run_in_executor(None, _do_nous_device_request)
+
+        device_data, effective_scope = await asyncio.get_running_loop().run_in_executor(
+            None, _do_nous_device_request
+        )
         sid, sess = _new_oauth_session("nous", "device_code")
         sess["device_code"] = str(device_data["device_code"])
         sess["interval"] = int(device_data["interval"])
         sess["expires_at"] = time.time() + int(device_data["expires_in"])
         sess["portal_base_url"] = portal_base_url
         sess["client_id"] = client_id
+        sess["scope"] = effective_scope
         threading.Thread(
             target=_nous_poller, args=(sid,), daemon=True, name=f"oauth-poll-{sid[:6]}"
         ).start()
@@ -1898,12 +1909,92 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
             "poll_interval": int(s.get("interval") or 5),
         }
 
+    if provider_id == "minimax-oauth":
+        # MiniMax uses a device-code-style flow (verification URI + user
+        # code + background poll) with a PKCE extension on top. From the
+        # operator's perspective it's identical to Nous's device-code
+        # flow; the PKCE bit (verifier + challenge from
+        # _minimax_pkce_pair) is a security extension that binds the
+        # token exchange to the original session.
+        from hermes_cli.auth import (
+            _minimax_pkce_pair,
+            _minimax_request_user_code,
+            MINIMAX_OAUTH_CLIENT_ID,
+            MINIMAX_OAUTH_GLOBAL_BASE,
+        )
+        import httpx
+        verifier, challenge, state = _minimax_pkce_pair()
+        portal_base_url = (
+            os.getenv("MINIMAX_PORTAL_BASE_URL") or MINIMAX_OAUTH_GLOBAL_BASE
+        ).rstrip("/")
+        def _do_minimax_request():
+            with httpx.Client(
+                timeout=httpx.Timeout(15.0),
+                headers={"Accept": "application/json"},
+                follow_redirects=True,
+            ) as client:
+                return _minimax_request_user_code(
+                    client=client,
+                    portal_base_url=portal_base_url,
+                    client_id=MINIMAX_OAUTH_CLIENT_ID,
+                    code_challenge=challenge,
+                    state=state,
+                )
+        device_data = await asyncio.get_event_loop().run_in_executor(
+            None, _do_minimax_request
+        )
+        sid, sess = _new_oauth_session("minimax-oauth", "device_code")
+        # The CLI flow names this `interval_ms` because MiniMax's
+        # `interval` field is in milliseconds (defensive default 2000ms
+        # in _minimax_poll_token).
+        interval_raw = device_data.get("interval")
+        sess["interval_ms"] = (
+            int(interval_raw) if interval_raw is not None else None
+        )
+        sess["user_code"] = str(device_data["user_code"])
+        sess["code_verifier"] = verifier
+        sess["state"] = state
+        sess["portal_base_url"] = portal_base_url
+        sess["client_id"] = MINIMAX_OAUTH_CLIENT_ID
+        sess["region"] = "global"
+        # `expired_in` from MiniMax is overloaded — could be a unix-ms
+        # timestamp OR a seconds-from-now duration. Mirror the heuristic
+        # in _minimax_poll_token. Stash the raw value for the poller;
+        # compute a derived expires_at + UI-friendly expires_in seconds.
+        expired_in_raw = int(device_data["expired_in"])
+        sess["expired_in_raw"] = expired_in_raw
+        if expired_in_raw > 1_000_000_000_000:  # likely unix-ms
+            expires_at_ts = expired_in_raw / 1000.0
+            expires_in_seconds = max(0, int(expires_at_ts - time.time()))
+        else:
+            expires_at_ts = time.time() + expired_in_raw
+            expires_in_seconds = expired_in_raw
+        sess["expires_at"] = expires_at_ts
+        threading.Thread(
+            target=_minimax_poller,
+            args=(sid,),
+            daemon=True,
+            name=f"oauth-poll-{sid[:6]}",
+        ).start()
+        return {
+            "session_id": sid,
+            "flow": "device_code",
+            "user_code": str(device_data["user_code"]),
+            "verification_url": str(device_data["verification_uri"]),
+            "expires_in": expires_in_seconds,
+            "poll_interval": max(2, (sess["interval_ms"] or 2000) // 1000),
+        }
+
     raise HTTPException(status_code=400, detail=f"Provider {provider_id} does not support device-code flow")
 
 
 def _nous_poller(session_id: str) -> None:
     """Background poller that drives a Nous device-code flow to completion."""
-    from hermes_cli.auth import _poll_for_token, refresh_nous_oauth_from_state
+    from hermes_cli.auth import (
+        NOUS_INFERENCE_AUTH_MODE_FRESH,
+        _poll_for_token,
+        refresh_nous_oauth_from_state,
+    )
     from datetime import datetime, timezone
     import httpx
     with _oauth_sessions_lock:
@@ -1914,6 +2005,7 @@ def _nous_poller(session_id: str) -> None:
     client_id = sess["client_id"]
     device_code = sess["device_code"]
     interval = sess["interval"]
+    scope = sess.get("scope")
     expires_in = max(60, int(sess["expires_at"] - time.time()))
     try:
         with httpx.Client(timeout=httpx.Timeout(15.0), headers={"Accept": "application/json"}) as client:
@@ -1932,7 +2024,7 @@ def _nous_poller(session_id: str) -> None:
             "portal_base_url": portal_base_url,
             "inference_base_url": token_data.get("inference_base_url"),
             "client_id": client_id,
-            "scope": token_data.get("scope"),
+            "scope": token_data.get("scope") or scope,
             "token_type": token_data.get("token_type", "Bearer"),
             "access_token": token_data["access_token"],
             "refresh_token": token_data.get("refresh_token"),
@@ -1944,8 +2036,11 @@ def _nous_poller(session_id: str) -> None:
             "expires_in": token_ttl,
         }
         full_state = refresh_nous_oauth_from_state(
-            auth_state, min_key_ttl_seconds=300, timeout_seconds=15.0,
-            force_refresh=False, force_mint=True,
+            auth_state,
+            min_key_ttl_seconds=300,
+            timeout_seconds=15.0,
+            force_refresh=False,
+            inference_auth_mode=NOUS_INFERENCE_AUTH_MODE_FRESH,
         )
         from hermes_cli.auth import persist_nous_credentials
         persist_nous_credentials(full_state)
@@ -1954,6 +2049,89 @@ def _nous_poller(session_id: str) -> None:
         _log.info("oauth/device: nous login completed (session=%s)", session_id)
     except Exception as e:
         _log.warning("nous device-code poll failed (session=%s): %s", session_id, e)
+        with _oauth_sessions_lock:
+            sess["status"] = "error"
+            sess["error_message"] = str(e)
+
+
+def _minimax_poller(session_id: str) -> None:
+    """Background poller that drives a MiniMax OAuth flow to completion.
+
+    Mirrors `_nous_poller` but calls the MiniMax-specific token endpoint,
+    which uses a PKCE-style ``code_verifier`` + ``user_code`` rather than
+    the ``device_code`` field used by Nous. On success, builds the same
+    auth_state dict that ``_minimax_oauth_login`` (the CLI flow) builds
+    and persists via ``_minimax_save_auth_state`` — so the dashboard
+    path leaves the system in the same state as
+    ``hermes auth add minimax-oauth``.
+    """
+    from hermes_cli.auth import (
+        _minimax_poll_token,
+        _minimax_resolve_token_expiry_unix,
+        _minimax_save_auth_state,
+        MINIMAX_OAUTH_GLOBAL_INFERENCE,
+        MINIMAX_OAUTH_SCOPE,
+    )
+    from datetime import datetime, timezone
+    import httpx
+    with _oauth_sessions_lock:
+        sess = _oauth_sessions.get(session_id)
+    if not sess:
+        return
+    portal_base_url = sess["portal_base_url"]
+    client_id = sess["client_id"]
+    user_code = sess["user_code"]
+    code_verifier = sess["code_verifier"]
+    interval_ms = sess.get("interval_ms")
+    expired_in_raw = sess["expired_in_raw"]
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(15.0),
+            headers={"Accept": "application/json"},
+            follow_redirects=True,
+        ) as client:
+            token_data = _minimax_poll_token(
+                client=client,
+                portal_base_url=portal_base_url,
+                client_id=client_id,
+                user_code=user_code,
+                code_verifier=code_verifier,
+                expired_in=expired_in_raw,
+                interval_ms=interval_ms,
+            )
+        # Build the auth_state dict in the same shape as the CLI flow's
+        # `_minimax_oauth_login` so `_minimax_save_auth_state` writes
+        # the canonical record. Region is fixed to "global" for the
+        # dashboard path; cn-region operators can still use the CLI
+        # flow which supports `--region cn`.
+        now = datetime.now(timezone.utc)
+        expires_at_ts = _minimax_resolve_token_expiry_unix(
+            int(token_data["expired_in"]), now=now,
+        )
+        expires_in_s = max(0, int(expires_at_ts - now.timestamp()))
+        auth_state = {
+            "provider": "minimax-oauth",
+            "region": sess.get("region", "global"),
+            "portal_base_url": portal_base_url,
+            "inference_base_url": MINIMAX_OAUTH_GLOBAL_INFERENCE,
+            "client_id": client_id,
+            "scope": MINIMAX_OAUTH_SCOPE,
+            "token_type": token_data.get("token_type", "Bearer"),
+            "access_token": token_data["access_token"],
+            "refresh_token": token_data["refresh_token"],
+            "resource_url": token_data.get("resource_url"),
+            "obtained_at": now.isoformat(),
+            "expires_at": datetime.fromtimestamp(
+                expires_at_ts, tz=timezone.utc
+            ).isoformat(),
+            "expires_in": expires_in_s,
+        }
+        _minimax_save_auth_state(auth_state)
+        with _oauth_sessions_lock:
+            sess["status"] = "approved"
+        _log.info("oauth/device: minimax login completed (session=%s)", session_id)
+    except Exception as e:
+        _log.warning("minimax device-code poll failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
             sess["status"] = "error"
             sess["error_message"] = str(e)
@@ -2111,7 +2289,13 @@ async def start_oauth_login(provider_id: str, request: Request):
             detail=f"{provider_id} uses an external CLI; run `{catalog_entry['cli_command']}` manually",
         )
     try:
-        if catalog_entry["flow"] == "pkce":
+        # The pkce branch is gated on provider_id == "anthropic" because
+        # `_start_anthropic_pkce()` is hardcoded to the Anthropic flow.
+        # Routing any other future pkce-flagged provider through it would
+        # silently launch the Anthropic OAuth flow (the bug fixed in this
+        # change for MiniMax). New PKCE providers must add their own
+        # start function and an explicit branch here.
+        if catalog_entry["flow"] == "pkce" and provider_id == "anthropic":
             return _start_anthropic_pkce()
         if catalog_entry["flow"] == "device_code":
             return await _start_device_code_flow(provider_id)
@@ -2376,73 +2560,181 @@ class CronJobUpdate(BaseModel):
     updates: dict
 
 
+_CRON_PROFILE_LOCK = threading.RLock()
+
+
+def _cron_profile_dicts() -> List[Dict[str, Any]]:
+    """Return dashboard profile records, falling back to a directory scan."""
+    from hermes_cli import profiles as profiles_mod
+    try:
+        return [_profile_to_dict(p) for p in profiles_mod.list_profiles()]
+    except Exception:
+        _log.exception("Failed to list profiles for cron dashboard; falling back to directory scan")
+        return _fallback_profile_dicts(profiles_mod)
+
+
+def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
+    """Resolve a profile query value to (profile_name, HERMES_HOME)."""
+    from hermes_cli import profiles as profiles_mod
+
+    raw = (profile or "default").strip() or "default"
+    try:
+        canon = profiles_mod.normalize_profile_name(raw)
+        profiles_mod.validate_profile_name(canon)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not profiles_mod.profile_exists(canon):
+        raise HTTPException(status_code=404, detail=f"Profile '{canon}' does not exist.")
+    return canon, profiles_mod.get_profile_dir(canon)
+
+
+def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[str, Any]:
+    annotated = dict(job)
+    annotated["profile"] = profile
+    annotated["profile_name"] = profile
+    annotated["hermes_home"] = str(home)
+    annotated["is_default_profile"] = profile == "default"
+    return annotated
+
+
+def _call_cron_for_profile(profile: Optional[str], func_name: str, *args, **kwargs):
+    """Run cron.jobs helpers against the selected profile's cron directory.
+
+    cron.jobs keeps CRON_DIR/JOBS_FILE/OUTPUT_DIR as module globals resolved
+    from the process HERMES_HOME at import time. The dashboard is a single
+    process that can inspect many profiles, so temporarily retarget those
+    globals while holding a lock and restore them immediately after the call.
+    """
+    profile_name, home = _cron_profile_home(profile)
+    with _CRON_PROFILE_LOCK:
+        from cron import jobs as cron_jobs
+
+        old_cron_dir = cron_jobs.CRON_DIR
+        old_jobs_file = cron_jobs.JOBS_FILE
+        old_output_dir = cron_jobs.OUTPUT_DIR
+        cron_jobs.CRON_DIR = home / "cron"
+        cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
+        cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
+        try:
+            result = getattr(cron_jobs, func_name)(*args, **kwargs)
+        finally:
+            cron_jobs.CRON_DIR = old_cron_dir
+            cron_jobs.JOBS_FILE = old_jobs_file
+            cron_jobs.OUTPUT_DIR = old_output_dir
+
+    if isinstance(result, list):
+        return [_annotate_cron_job(j, profile_name, home) for j in result]
+    if isinstance(result, dict):
+        return _annotate_cron_job(result, profile_name, home)
+    return result
+
+
+def _find_cron_job_profile(job_id: str) -> Optional[str]:
+    for profile in _cron_profile_dicts():
+        name = str(profile.get("name") or "")
+        if not name:
+            continue
+        jobs = _call_cron_for_profile(name, "list_jobs", True)
+        if any(j.get("id") == job_id or j.get("name") == job_id for j in jobs):
+            return name
+    return None
+
+
 @app.get("/api/cron/jobs")
-async def list_cron_jobs():
-    from cron.jobs import list_jobs
-    return list_jobs(include_disabled=True)
+async def list_cron_jobs(profile: str = "all"):
+    requested = (profile or "all").strip()
+    if requested.lower() != "all":
+        return _call_cron_for_profile(requested, "list_jobs", True)
+
+    jobs: List[Dict[str, Any]] = []
+    for item in _cron_profile_dicts():
+        name = str(item.get("name") or "")
+        if not name:
+            continue
+        try:
+            jobs.extend(_call_cron_for_profile(name, "list_jobs", True))
+        except Exception:
+            _log.exception("Failed to list cron jobs for profile %s", name)
+    return jobs
 
 
 @app.get("/api/cron/jobs/{job_id}")
-async def get_cron_job(job_id: str):
-    from cron.jobs import get_job
-    job = get_job(job_id)
+async def get_cron_job(job_id: str, profile: Optional[str] = None):
+    selected = profile or _find_cron_job_profile(job_id)
+    if not selected:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = _call_cron_for_profile(selected, "get_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
 
 
 @app.post("/api/cron/jobs")
-async def create_cron_job(body: CronJobCreate):
-    from cron.jobs import create_job
+async def create_cron_job(body: CronJobCreate, profile: str = "default"):
     try:
-        job = create_job(prompt=body.prompt, schedule=body.schedule,
-                         name=body.name, deliver=body.deliver)
-        return job
+        return _call_cron_for_profile(
+            profile,
+            "create_job",
+            prompt=body.prompt,
+            schedule=body.schedule,
+            name=body.name,
+            deliver=body.deliver,
+        )
     except Exception as e:
         _log.exception("POST /api/cron/jobs failed")
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.put("/api/cron/jobs/{job_id}")
-async def update_cron_job(job_id: str, body: CronJobUpdate):
-    from cron.jobs import update_job
-    job = update_job(job_id, body.updates)
+async def update_cron_job(job_id: str, body: CronJobUpdate, profile: Optional[str] = None):
+    selected = profile or _find_cron_job_profile(job_id)
+    if not selected:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = _call_cron_for_profile(selected, "update_job", job_id, body.updates)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
 
 
 @app.post("/api/cron/jobs/{job_id}/pause")
-async def pause_cron_job(job_id: str):
-    from cron.jobs import pause_job
-    job = pause_job(job_id)
+async def pause_cron_job(job_id: str, profile: Optional[str] = None):
+    selected = profile or _find_cron_job_profile(job_id)
+    if not selected:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = _call_cron_for_profile(selected, "pause_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
 
 
 @app.post("/api/cron/jobs/{job_id}/resume")
-async def resume_cron_job(job_id: str):
-    from cron.jobs import resume_job
-    job = resume_job(job_id)
+async def resume_cron_job(job_id: str, profile: Optional[str] = None):
+    selected = profile or _find_cron_job_profile(job_id)
+    if not selected:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = _call_cron_for_profile(selected, "resume_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
 
 
 @app.post("/api/cron/jobs/{job_id}/trigger")
-async def trigger_cron_job(job_id: str):
-    from cron.jobs import trigger_job
-    job = trigger_job(job_id)
+async def trigger_cron_job(job_id: str, profile: Optional[str] = None):
+    selected = profile or _find_cron_job_profile(job_id)
+    if not selected:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = _call_cron_for_profile(selected, "trigger_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
 
 
 @app.delete("/api/cron/jobs/{job_id}")
-async def delete_cron_job(job_id: str):
-    from cron.jobs import remove_job
-    if not remove_job(job_id):
+async def delete_cron_job(job_id: str, profile: Optional[str] = None):
+    selected = profile or _find_cron_job_profile(job_id)
+    if not selected:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not _call_cron_for_profile(selected, "remove_job", job_id):
         raise HTTPException(status_code=404, detail="Job not found")
     return {"ok": True}
 
@@ -3058,6 +3350,7 @@ def _resolve_chat_argv(
     # build unchanged for native CLI usage; only disable mouse tracking for
     # the dashboard PTY path.
     env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
+    env.setdefault("HERMES_TUI_INLINE", "1")
 
     if resume:
         latest_resume, _latest_path = _session_latest_descendant(resume)
@@ -3837,6 +4130,9 @@ def _get_dashboard_plugins(force_rescan: bool = False) -> list:
     global _dashboard_plugins_cache
     if _dashboard_plugins_cache is None or force_rescan:
         _dashboard_plugins_cache = _discover_dashboard_plugins()
+    elif _dashboard_plugins_cache:
+        if any(not Path(p["_dir"]).is_dir() for p in _dashboard_plugins_cache):
+            _dashboard_plugins_cache = _discover_dashboard_plugins()
     return _dashboard_plugins_cache
 
 
@@ -4159,7 +4455,11 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
         ".woff": "font/woff",
     }
     media_type = content_types.get(suffix, "application/octet-stream")
-    return FileResponse(target, media_type=media_type)
+    return FileResponse(
+        target,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 def _mount_plugin_api_routes():
@@ -4248,11 +4548,36 @@ def start_server(
     if open_browser:
         import webbrowser
 
-        def _open():
-            time.sleep(1.0)
-            webbrowser.open(f"http://{host}:{port}")
+        # On headless Linux (no DISPLAY or WAYLAND_DISPLAY) some registered
+        # browsers are TUI programs (links, lynx, www-browser) that try to
+        # take over the terminal.  That can send SIGHUP to the server process
+        # and cause an immediate exit even though uvicorn bound successfully.
+        # Skip the auto-open attempt on headless systems and let the user
+        # open the URL manually.  macOS and Windows are always considered
+        # display-capable.
+        _has_display = (
+            sys.platform != "linux"
+            or bool(os.environ.get("DISPLAY"))
+            or bool(os.environ.get("WAYLAND_DISPLAY"))
+        )
 
-        threading.Thread(target=_open, daemon=True).start()
+        if _has_display:
+            def _open():
+                try:
+                    time.sleep(1.0)
+                    webbrowser.open(f"http://{host}:{port}")
+                except Exception:
+                    pass
+
+            threading.Thread(target=_open, daemon=True).start()
+        else:
+            _log.debug(
+                "Skipping browser-open: no DISPLAY or WAYLAND_DISPLAY detected "
+                "(headless Linux). Pass --no-open to suppress this detection."
+            )
 
     print(f"  Hermes Web UI → http://{host}:{port}")
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    # proxy_headers=False so _ws_client_is_allowed sees the real connection peer
+    # rather than X-Forwarded-For's rewritten value (which would defeat the
+    # loopback gate when behind a reverse proxy).
+    uvicorn.run(app, host=host, port=port, log_level="warning", proxy_headers=False)

@@ -48,7 +48,7 @@ const renderPlain = (node: React.ReactNode) => {
 describe('INLINE_RE emphasis', () => {
   it('matches word-boundary italic/bold', () => {
     expect(matches('say _hi_ there')).toEqual(['_hi_'])
-    expect(matches('very __bold__ move')).toEqual(['__bold__'])
+    expect(matches('very __bold move__ today')).toEqual(['__bold move__'])
     expect(matches('(_paren_) and [_bracket_]')).toEqual(['_paren_', '_bracket_'])
   })
 
@@ -58,6 +58,12 @@ describe('INLINE_RE emphasis', () => {
     expect(matches(path)).toEqual([])
     expect(matches('snake_case_var and MY_CONST')).toEqual([])
     expect(matches('foo__bar__baz')).toEqual([])
+  })
+
+  it('keeps Python dunder identifiers literal', () => {
+    expect(matches('if __name__ == "__main__":')).toEqual([])
+    expect(matches('def __init__(self):')).toEqual([])
+    expect(matches('print(__file__)')).toEqual([])
   })
 
   it('still matches asterisk emphasis intraword', () => {
@@ -95,7 +101,12 @@ describe('stripInlineMarkup', () => {
   it('strips word-boundary emphasis only', () => {
     expect(stripInlineMarkup('say _hi_ there')).toBe('say hi there')
     expect(stripInlineMarkup('browser_screenshot_ecc.png')).toBe('browser_screenshot_ecc.png')
-    expect(stripInlineMarkup('__bold__ and foo__bar__')).toBe('bold and foo__bar__')
+    expect(stripInlineMarkup('__bold move__ and foo__bar__')).toBe('bold move and foo__bar__')
+  })
+
+  it('preserves Python dunder identifiers', () => {
+    expect(stripInlineMarkup('if __name__ == "__main__":')).toBe('if __name__ == "__main__":')
+    expect(stripInlineMarkup('class X: def __init__(self): pass')).toBe('class X: def __init__(self): pass')
   })
 
   it('leaves ~!/~? kaomoji alone and still handles real subscript', () => {
@@ -228,6 +239,24 @@ describe('Md wrapping', () => {
 
     expect(lines.join('\n')).toContain('or done')
   })
+
+  it('renders Python dunder identifiers literally outside code fences', () => {
+    const lines = renderPlain(
+      React.createElement(
+        Box,
+        { width: 80 },
+        React.createElement(Md, {
+          t: DEFAULT_THEME,
+          text: 'if __name__ == "__main__":\n    obj.__init__()'
+        })
+      )
+    )
+
+    const rendered = lines.join('\n')
+
+    expect(rendered).toContain('if __name__ == "__main__":')
+    expect(rendered).toContain('obj.__init__()')
+  })
 })
 
 describe('Md copy-source fragments', () => {
@@ -286,6 +315,41 @@ describe('Md copy-source fragments', () => {
     })
 
     expect(copied).toBe('inline: $E = mc^2$ or')
+  })
+})
+
+describe('Md link labels', () => {
+  it('renders bare URLs with readable slug labels', () => {
+    const lines = renderPlain(
+      React.createElement(
+        Box,
+        { width: 120 },
+        React.createElement(Md, {
+          t: DEFAULT_THEME,
+          text: 'see https://www.expedia.com/things-to-do/puerto-rico-el-yunque-rainforest-adventure for details'
+        })
+      )
+    )
+
+    const rendered = lines.join('\n')
+
+    expect(rendered).toContain('Puerto Rico El Yunque Rainforest Adventure')
+    expect(rendered).not.toContain('https://www.expedia.com/things-to-do/puerto-rico-el-yunque-rainforest-adventure')
+  })
+
+  it('keeps explicit markdown labels as the immediate fallback', () => {
+    const lines = renderPlain(
+      React.createElement(
+        Box,
+        { width: 80 },
+        React.createElement(Md, {
+          t: DEFAULT_THEME,
+          text: '[Trip details](https://www.expedia.com/things-to-do/puerto-rico-el-yunque-rainforest-adventure)'
+        })
+      )
+    )
+
+    expect(lines.join('\n')).toContain('Trip details')
   })
 })
 

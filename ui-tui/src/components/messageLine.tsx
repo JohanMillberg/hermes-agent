@@ -9,11 +9,11 @@ import { CopySource } from '../lib/copySource/CopySource.js'
 import { buildLineStartsFromRows, simpleOffsetFor } from '../lib/copySource/offsetMaps.js'
 import { transcriptBodyWidth, transcriptGutterWidth } from '../lib/inputMetrics.js'
 import {
-  boundedHistoryRenderText,
   boundedLiveRenderText,
   compactPreview,
   hasAnsi,
   isPasteBackedText,
+  sanitizeAnsiForRender,
   stripAnsi
 } from '../lib/text.js'
 import type { Theme } from '../theme.js'
@@ -33,7 +33,6 @@ export const MessageLine = memo(function MessageLine({
   detailsMode = 'collapsed',
   detailsModeCommandOverride = false,
   isStreaming = false,
-  limitHistoryRender = false,
   msg,
   msgId,
   sections,
@@ -89,11 +88,12 @@ export const MessageLine = memo(function MessageLine({
   if (msg.role === 'tool') {
     const maxChars = Math.max(24, cols - 14)
     const stripped = hasAnsi(msg.text) ? stripAnsi(msg.text) : msg.text
+    const safeAnsi = hasAnsi(msg.text) ? sanitizeAnsiForRender(msg.text) : msg.text
     const preview = compactPreview(stripped, maxChars) || '(empty tool result)'
 
     const previewNode = hasAnsi(msg.text) ? (
       <Text wrap="truncate-end">
-        <Ansi>{msg.text}</Ansi>
+        <Ansi>{safeAnsi}</Ansi>
       </Text>
     ) : (
       <Text color={t.color.muted} wrap="truncate-end">
@@ -135,27 +135,28 @@ export const MessageLine = memo(function MessageLine({
               {msg.text.length.toLocaleString()} chars
             </Text>
           </Box>
-          {systemOpen && wrapCopySource(msgId, msg.text, <Ansi>{msg.text}</Ansi>)}
+          {systemOpen && wrapCopySource(msgId, msg.text, <Ansi>{sanitizeAnsiForRender(msg.text)}</Ansi>)}
         </Box>
       )
     }
 
     if (msg.role !== 'user' && hasAnsi(msg.text)) {
-      return wrapCopySource(msgId, msg.text, <Ansi>{msg.text}</Ansi>)
+      return wrapCopySource(msgId, msg.text, <Ansi>{sanitizeAnsiForRender(msg.text)}</Ansi>)
     }
 
     if (msg.role === 'assistant') {
+      const bodyWidth = transcriptBodyWidth(cols, msg.role, t.brand.prompt)
+
       return isStreaming ? (
         // Incremental markdown: split at the last stable block boundary so
         // only the in-flight tail re-tokenizes per delta. See
         // streamingMarkdown.tsx for the cost model.
-        <StreamingMd compact={compact} msgId={msgId} t={t} text={boundedLiveRenderText(msg.text)} />
+        <StreamingMd cols={bodyWidth} compact={compact} msgId={msgId} t={t} text={boundedLiveRenderText(msg.text)} />
       ) : (
-        <Md
-          compact={compact}
+        <Md cols={bodyWidth} compact={compact}
           msgId={msgId}
           t={t}
-          text={limitHistoryRender ? boundedHistoryRenderText(msg.text) : msg.text}
+          text={msg.text}
         />
       )
     }
@@ -225,7 +226,6 @@ interface MessageLineProps {
   detailsMode?: DetailsMode
   detailsModeCommandOverride?: boolean
   isStreaming?: boolean
-  limitHistoryRender?: boolean
   msg: Msg
   /** Stable id used to anchor copy-source ranges in the registry. When
    * unset, the message isn't covered by the copy-source pipeline — its
