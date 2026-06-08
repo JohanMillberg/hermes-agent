@@ -25,6 +25,12 @@ export interface RendererOptions {
    * default is an immediate `renderer.destroy()` (quit).
    */
   readonly onCtrlC?: () => void
+  /**
+   * Copy a mouse selection (item 1). When there's a live selection, Ctrl+C copies
+   * it (this callback) instead of interrupting/quitting — opencode's selection
+   * key precedence (`app.tsx:388`).
+   */
+  readonly onCopySelection?: (text: string) => void
 }
 
 /**
@@ -64,6 +70,16 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
   const isBlocked = options.isBlocked ?? (() => false)
   renderer.keyInput.on('keypress', (key: KeyEvent) => {
     if (!(key.ctrl && key.name === 'c') || renderer.isDestroyed) return
+    // Copy a live mouse selection first (item 1) — takes precedence over the
+    // interrupt/quit machine and over a blocking prompt's cancel.
+    if (options.onCopySelection) {
+      const text = renderer.getSelection()?.getSelectedText() ?? ''
+      if (text) {
+        options.onCopySelection(text)
+        renderer.clearSelection()
+        return
+      }
+    }
     if (isBlocked()) return // a blocking prompt owns Ctrl+C (→ deny/cancel)
     if (options.onCtrlC) options.onCtrlC()
     else renderer.destroy()

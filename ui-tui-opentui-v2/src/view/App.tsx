@@ -37,6 +37,7 @@ export interface AppProps {
   readonly onResume?: (sessionId: string) => void
   readonly sessionId?: () => string | undefined
   readonly history?: PromptHistory
+  readonly onImagePaste?: () => void
 }
 
 const NOOP = () => {}
@@ -89,6 +90,7 @@ export function App(props: AppProps) {
                     completionFrom={() => props.store.state.completionFrom}
                     onDismiss={() => props.store.clearCompletions()}
                     history={props.history}
+                    onImagePaste={props.onImagePaste}
                   />
                 }
               >

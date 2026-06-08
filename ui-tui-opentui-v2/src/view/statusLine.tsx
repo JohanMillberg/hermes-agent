@@ -21,7 +21,7 @@ export function StatusLine(props: { store: SessionStore }) {
     <Show when={line()}>
       {text => (
         <box style={{ flexShrink: 0 }}>
-          <text>
+          <text selectable={false}>
             <span style={{ fg: isHint() ? theme().color.warn : theme().color.muted }}>{text()}</span>
           </text>
         </box>

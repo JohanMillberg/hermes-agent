@@ -22,6 +22,7 @@
 import { render } from '@opentui/solid'
 import { Deferred, Duration, Effect } from 'effect'
 
+import { readClipboardImage, writeClipboard } from '../boundary/clipboard.ts'
 import { GatewayService, type GatewayServiceShape } from '../boundary/gateway/GatewayService.ts'
 import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
 import { getLog } from '../boundary/log.ts'
@@ -199,11 +200,51 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         }
       }
 
+      // Transient hint that auto-clears (used by copy/image-paste feedback).
+      const flashHint = (message: string, ms = 1500) => {
+        store.setHint(message)
+        setTimeout(() => {
+          if (store.state.hint === message) store.setHint(undefined)
+        }, ms)
+      }
+
+      // Copy a mouse selection to the clipboard (item 1) — OSC 52 + native command.
+      const onCopySelection = (text: string) => {
+        void writeClipboard(text)
+        flashHint('Copied to clipboard')
+      }
+
+      // Paste an IMAGE (item 1): read the clipboard image and attach it to the
+      // session (image.attach_bytes); the next prompt.submit picks it up.
+      const onImagePaste = () => {
+        void (async () => {
+          const img = await readClipboardImage()
+          if (!img) {
+            flashHint('No image in clipboard', 2000)
+            return
+          }
+          const sid = gateway.sessionId()
+          if (!sid) {
+            flashHint('No session for image', 2000)
+            return
+          }
+          try {
+            await Effect.runPromise(
+              gateway.request('image.attach_bytes', { content_base64: img.data, filename: 'pasted.png', session_id: sid })
+            )
+            flashHint('🖼 image attached — type a message and send', 3000)
+          } catch {
+            flashHint('Image attach failed', 2000)
+          }
+        })()
+      }
+
       // A blocking prompt owns Ctrl+C (→ cancel); otherwise the state machine above runs.
       const { renderer, shutdown } = yield* acquireRenderer({
         mouse: input.mouse,
         isBlocked: () => store.state.prompt !== undefined,
-        onCtrlC
+        onCtrlC,
+        onCopySelection
       })
       doQuit = () => {
         if (!renderer.isDestroyed) renderer.destroy()
@@ -313,6 +354,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                 onResume={onResume}
                 sessionId={() => gateway.sessionId()}
                 history={history}
+                onImagePaste={onImagePaste}
               />
             </ThemeProvider>
           ),

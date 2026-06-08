@@ -19,7 +19,7 @@
  * the prompt focused via a reactive effect; here a keystroke net is enough since
  * the composer remounts+refocuses whenever an overlay closes).
  */
-import { type TextareaRenderable } from '@opentui/core'
+import { type PasteEvent, type TextareaRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
 import { For, onMount, Show } from 'solid-js'
 
@@ -80,6 +80,7 @@ export function Composer(props: {
   completionFrom?: (() => number) | undefined
   onDismiss?: (() => void) | undefined
   history?: PromptHistory | undefined
+  onImagePaste?: (() => void) | undefined
 }) {
   const theme = useTheme()
   let ta: TextareaRenderable | undefined
@@ -182,7 +183,7 @@ export function Composer(props: {
           not a background tint. */}
       <box style={{ flexDirection: 'row', flexShrink: 0 }}>
         <box style={{ flexShrink: 0, width: GUTTER }}>
-          <text>
+          <text selectable={false}>
             <span style={{ fg: theme().color.prompt }}>{theme().brand.prompt}</span>
           </text>
         </box>
@@ -196,6 +197,14 @@ export function Composer(props: {
           keyBindings={[{ action: 'submit', name: 'return' }]}
           onMouseDown={() => ta?.focus()}
           onSubmit={submit}
+          onPaste={(e: PasteEvent) => {
+            // An empty bracketed paste = an image-only clipboard (item 1) — read +
+            // attach it. Text pastes fall through to the textarea's native insert.
+            if (new TextDecoder().decode(e.bytes).trim() === '') {
+              e.preventDefault()
+              props.onImagePaste?.()
+            }
+          }}
           onContentChange={() => props.onType?.(ta?.plainText ?? '')}
         />
       </box>

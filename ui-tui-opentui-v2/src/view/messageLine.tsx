@@ -28,7 +28,8 @@ export function MessageLine(props: { message: Message }) {
   return (
     <box style={{ flexDirection: 'row', flexShrink: 0, marginTop: m().role === 'user' ? 1 : 0 }}>
       <box style={{ flexShrink: 0, width: GUTTER }}>
-        <text>
+        {/* the role glyph is decorative — exclude it from mouse selection (item 4) */}
+        <text selectable={false}>
           <span style={{ fg: glyphFg() }}>{glyph()}</span>
         </text>
       </box>

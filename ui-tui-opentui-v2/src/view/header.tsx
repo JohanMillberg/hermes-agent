@@ -13,7 +13,7 @@ export function Header(props: { store: SessionStore }) {
   const theme = useTheme()
   return (
     <box style={{ flexShrink: 0 }}>
-      <text>
+      <text selectable={false}>
         <b>{theme().brand.name}</b>
         <span style={{ fg: theme().color.muted }}> · opentui · </span>
         <Show when={props.store.state.ready} fallback={<span style={{ fg: theme().color.muted }}>connecting…</span>}>

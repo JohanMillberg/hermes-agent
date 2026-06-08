@@ -45,7 +45,7 @@ export function ToolPart(props: { part: ToolPartState }) {
       {/* header — clickable to toggle when there's expandable output */}
       <box style={{ flexDirection: 'row', flexShrink: 0 }} onMouseDown={() => collapsible() && setExpanded(e => !e)}>
         <box style={{ flexShrink: 0, width: GUTTER }}>
-          <text>
+          <text selectable={false}>
             <span style={{ fg: headColor() }}>{headGlyph()}</span>
           </text>
         </box>

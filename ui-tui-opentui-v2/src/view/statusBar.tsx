@@ -104,7 +104,7 @@ export function StatusBar(props: { store: SessionStore }) {
     >
       {/* left: turn/connection dot + model + effort + context bar */}
       <box style={{ flexShrink: 0, flexDirection: 'row' }}>
-        <text>
+        <text selectable={false}>
           <span style={{ fg: dotColor() }}>{dot()}</span>
           <Show when={model()}>
             <span style={{ fg: theme().color.statusFg }}>{` ${model()}`}</span>
@@ -124,7 +124,7 @@ export function StatusBar(props: { store: SessionStore }) {
       {/* right: cwd (branch), pre-truncated so the row never wraps */}
       <Show when={rightText()}>
         <box style={{ flexShrink: 0, flexDirection: 'row' }}>
-          <text>
+          <text selectable={false}>
             <span style={{ fg: theme().color.muted }}>{rightText()}</span>
           </text>
         </box>
