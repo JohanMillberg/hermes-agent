@@ -105,6 +105,8 @@ You can still bring your own keys per-tool whenever you want — the gateway is 
 
 Hermes has two entry points: start the terminal UI with `hermes`, or run the gateway and talk to it from Telegram, Discord, Slack, WhatsApp, Signal, or Email. Once you're in a conversation, many slash commands are shared across both interfaces.
 
+> **TUI engine:** On supported hosts (Linux/macOS with [Bun](https://bun.sh)), the terminal UI defaults to the native **OpenTUI** engine, which the installer provisions for you. The legacy **Ink** engine remains the fallback — it's used automatically on Windows, Termux, or when Bun isn't available, and you can select it explicitly with `HERMES_TUI_ENGINE=ink hermes`. Ink is not going away; it's the kept fallback.
+
 | Action                         | CLI                                           | Messaging platforms                                                              |
 | ------------------------------ | --------------------------------------------- | -------------------------------------------------------------------------------- |
 | Start chatting                 | `hermes`                                      | Run `hermes gateway setup` + `hermes gateway start`, then send the bot a message |
