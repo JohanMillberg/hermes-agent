@@ -10,22 +10,30 @@
  *     viewport/content children; setting it there breaks content-height
  *     measurement → phantom scroll offset that clips the top + leaves a gap),
  *   - `stickyScroll` + `stickyStart="bottom"` to pin the latest line.
+ *
+ * A `ScrollAnchorProvider` gives collapse/expand toggles (tool/thinking) a handle
+ * to hold the viewport in place so expanding doesn't yank to the bottom (#4).
  */
-import { For, Show } from 'solid-js'
+import type { ScrollBoxRenderable } from '@opentui/core'
+import { createSignal, For, Show } from 'solid-js'
 
 import type { SessionStore } from '../logic/store.ts'
 import { HomeHint } from './homeHint.tsx'
 import { MessageLine } from './messageLine.tsx'
+import { ScrollAnchorProvider } from './scrollAnchor.tsx'
 
 export function Transcript(props: { store: SessionStore }) {
+  const [scroll, setScroll] = createSignal<ScrollBoxRenderable | undefined>()
   return (
     <box style={{ flexGrow: 1, minHeight: 0, marginTop: 1 }}>
-      <scrollbox style={{ flexGrow: 1, minHeight: 0 }} stickyScroll stickyStart="bottom">
-        {/* empty-transcript home screen (item 12); replaced by messages on the first turn */}
-        <Show when={props.store.state.messages.length === 0}>
-          <HomeHint catalog={props.store.state.catalog} />
-        </Show>
-        <For each={props.store.state.messages}>{message => <MessageLine message={message} />}</For>
+      <scrollbox ref={setScroll} style={{ flexGrow: 1, minHeight: 0 }} stickyScroll stickyStart="bottom">
+        <ScrollAnchorProvider scroll={scroll}>
+          {/* empty-transcript home screen (item 12); replaced by messages on the first turn */}
+          <Show when={props.store.state.messages.length === 0}>
+            <HomeHint catalog={props.store.state.catalog} />
+          </Show>
+          <For each={props.store.state.messages}>{message => <MessageLine message={message} />}</For>
+        </ScrollAnchorProvider>
       </scrollbox>
     </box>
   )

@@ -14,6 +14,7 @@
 import { createMemo, createSignal, Show } from 'solid-js'
 
 import { Markdown } from './markdown.tsx'
+import { useScrollAnchor } from './scrollAnchor.tsx'
 import { useTheme } from './theme.tsx'
 
 const GUTTER = 2
@@ -29,9 +30,11 @@ function reasoningSummary(text: string): { title?: string; body: string } {
 
 export function ReasoningPart(props: { text: string; streaming?: boolean }) {
   const theme = useTheme()
+  const anchor = useScrollAnchor()
   const [override, setOverride] = createSignal<boolean | undefined>(undefined)
   // live → expanded so you see it think; settled → collapsed. Click overrides.
   const expanded = () => override() ?? !!props.streaming
+  const toggle = () => anchor(() => setOverride(e => !(e ?? !!props.streaming)))
   const summary = createMemo(() => reasoningSummary(props.text))
   const label = () => (props.streaming ? 'Thinking' : 'Thought')
 
@@ -40,7 +43,7 @@ export function ReasoningPart(props: { text: string; streaming?: boolean }) {
       <box style={{ flexDirection: 'column', flexShrink: 0 }}>
         <box
           style={{ flexDirection: 'row', flexShrink: 0 }}
-          onMouseDown={() => setOverride(e => !(e ?? !!props.streaming))}
+          onMouseDown={toggle}
         >
           <box style={{ flexShrink: 0, width: GUTTER }}>
             <text selectable={false}>

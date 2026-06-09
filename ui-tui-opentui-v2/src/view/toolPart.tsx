@@ -18,6 +18,7 @@ import { useDimensions } from './dimensions.tsx'
 import { createMemo, createSignal, For, Show } from 'solid-js'
 
 import { collapseToolOutput, truncate } from '../logic/toolOutput.ts'
+import { useScrollAnchor } from './scrollAnchor.tsx'
 import { useTheme } from './theme.tsx'
 
 const GUTTER = 2
@@ -37,7 +38,9 @@ function fmtDuration(s: number): string {
 export function ToolPart(props: { part: ToolPartState }) {
   const theme = useTheme()
   const dims = useDimensions()
+  const anchor = useScrollAnchor()
   const [expanded, setExpanded] = createSignal(false)
+  const toggle = () => anchor(() => setExpanded(e => !e))
 
   const bodyWidth = () => Math.max(20, dims().width - GUTTER - 4)
   const result = () => (props.part.resultText ?? '').replace(/\s+$/, '')
@@ -91,7 +94,7 @@ export function ToolPart(props: { part: ToolPartState }) {
     // margins — so a tool appearing mid-stream doesn't shift the layout (item 5).
     <box style={{ flexDirection: 'column', flexShrink: 0 }}>
       {/* header — clickable to toggle when there's expandable output/args */}
-      <box style={{ flexDirection: 'row', flexShrink: 0 }} onMouseDown={() => collapsible() && setExpanded(e => !e)}>
+      <box style={{ flexDirection: 'row', flexShrink: 0 }} onMouseDown={() => collapsible() && toggle()}>
         <box style={{ flexShrink: 0, width: GUTTER }}>
           <text selectable={false}>
             <span style={{ fg: headColor() }}>{headGlyph()}</span>
