@@ -1,11 +1,18 @@
 /**
- * Markdown — assistant/reasoning text rendered with the NATIVE renderable, never
- * a hand-rolled parser (spec v4 §7). Uses `<code filetype="markdown" streaming>`
- * (`CodeRenderable`) — opencode's v2 text path (`session-v2.tsx:358` AssistantText)
- * — backed by the same markdown tokenizer + Tree-sitter as `<markdown>`, but it
- * paints reliably (incl. headless): `drawUnstyledText` draws the raw text
- * immediately while highlighting settles, `conceal` hides the `**`/backtick
- * markers, `streaming` feeds incremental deltas.
+ * Markdown — assistant/reasoning text via the NATIVE `<markdown>` renderable
+ * (`MarkdownRenderable`), exactly as opencode's TextPart (`routes/session/index.tsx`
+ * :1687 `<markdown streaming internalBlockMode="top-level" tableOptions conceal>`).
+ *
+ * Why `<markdown>` (not `<code filetype="markdown">`): the anti-flicker mechanism
+ * is `internalBlockMode="top-level"` — each top-level block (heading/para/list/
+ * table/fence) becomes its own child renderable and `_stableBlockCount` (managed
+ * internally) reports the settled head prefix, so stable blocks are NOT re-rendered
+ * per streamed delta. The old `<code>` path re-measured the whole buffer each delta
+ * → the content height oscillated → the scrollbar grew/shrank (the streaming
+ * flicker regression). `tableOptions` renders GFM tables as an aligned grid WITH
+ * inline markdown (bold/italic/code) inside cells — so a separate table renderer
+ * is unnecessary. `streaming` keeps the trailing block open while chunks append and
+ * finalizes it (half-open tables/fences) when flipped false.
  *
  * The `SyntaxStyle` is derived from the active theme (no hardcoded styles — §7.5)
  * and cached by theme-object identity, so all text parts share ONE instance and
@@ -53,18 +60,16 @@ function syntaxStyleFor(theme: Theme): SyntaxStyle {
 
 export function Markdown(props: { text: string; streaming?: boolean; fg?: string }) {
   const theme = useTheme()
-  // opencode's v2 text path (session-v2.tsx AssistantText): the markdown engine via
-  // <code filetype="markdown" streaming>. `drawUnstyledText={false}` avoids the
-  // raw→styled flash per delta (the streaming flicker); `streaming` re-tokenizes
-  // incrementally rather than reparsing the whole buffer each repaint. `fg`
-  // overrides the base text color (e.g. muted for reasoning bodies — item 6).
+  // `internalBlockMode="top-level"` is the anti-flicker mode (stable head blocks
+  // aren't re-rendered per delta); `tableOptions` gives native GFM tables with
+  // inline formatting; `fg` overrides the base text color (muted for reasoning).
   return (
-    <code
-      filetype="markdown"
+    <markdown
       content={props.text}
       syntaxStyle={syntaxStyleFor(theme())}
       streaming={props.streaming ?? false}
-      drawUnstyledText={false}
+      internalBlockMode="top-level"
+      tableOptions={{ style: 'grid', borderColor: theme().color.border }}
       conceal
       fg={props.fg ?? theme().color.text}
     />

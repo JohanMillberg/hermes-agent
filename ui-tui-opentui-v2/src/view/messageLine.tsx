@@ -8,33 +8,15 @@
  * Stable `id` per part as the <For> key so a new tool part below a streaming text
  * part doesn't remount it. Native <markdown> for text parts lands in 2b-ii.
  */
-import { createMemo, For, Match, Show, Switch } from 'solid-js'
+import { For, Match, Show, Switch } from 'solid-js'
 
-import { segmentMarkdown } from '../logic/mdTable.ts'
 import type { Message } from '../logic/store.ts'
 import { Markdown } from './markdown.tsx'
-import { MdTable } from './mdTable.tsx'
 import { ReasoningPart } from './reasoningPart.tsx'
 import { useTheme } from './theme.tsx'
 import { ToolPart } from './toolPart.tsx'
 
 const GUTTER = 2
-
-/** A text part: native markdown for prose, an aligned grid for GFM tables (item 7). */
-function AssistantText(props: { text: string; streaming: boolean }) {
-  const segments = createMemo(() => segmentMarkdown(props.text.replace(/^\n+|\n+$/g, '')))
-  return (
-    <For each={segments()}>
-      {seg =>
-        seg.kind === 'table' ? (
-          <MdTable seg={seg} />
-        ) : (
-          <Markdown text={seg.text.replace(/^\n+|\n+$/g, '')} streaming={props.streaming} />
-        )
-      }
-    </For>
-  )
-}
 
 export function MessageLine(props: { message: Message }) {
   const theme = useTheme()
@@ -87,10 +69,11 @@ export function MessageLine(props: { message: Message }) {
                   {r => <ReasoningPart text={r().text} streaming={m().streaming ?? false} />}
                 </Match>
                 <Match when={part.type === 'text' && part}>
-                  {/* prose via the native renderable; GFM tables as an aligned grid
-                      (item 7). Leading/trailing blanks are stripped so the column
-                      `gap` is the sole inter-part spacing — no jitter (item 5). */}
-                  {t => <AssistantText text={t().text} streaming={m().streaming ?? false} />}
+                  {/* ONE stable native <markdown> fed the growing text in place (no
+                      per-delta remount → no scrollbar flicker, #2); it renders GFM
+                      tables natively (#3). Leading/trailing blanks stripped so the
+                      column `gap` is the sole inter-part spacing (item 5). */}
+                  {t => <Markdown text={t().text.replace(/^\n+|\n+$/g, '')} streaming={m().streaming ?? false} />}
                 </Match>
               </Switch>
             )}
