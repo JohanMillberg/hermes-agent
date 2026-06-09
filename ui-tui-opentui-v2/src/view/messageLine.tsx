@@ -56,7 +56,10 @@ export function MessageLine(props: { message: Message }) {
             <Show
               when={m().streaming && !hasParts()}
               fallback={
-                <text>
+                // themed selection: a solid muted/accent bar that preserves the
+                // text fg (no selectionFg → the original color shows through, so a
+                // highlight over content reads as a clean bar, not SGR-inverse).
+                <text selectionBg={theme().color.selectionBg}>
                   <span style={{ fg: bodyFg() }}>{m().text}</span>
                 </text>
               }

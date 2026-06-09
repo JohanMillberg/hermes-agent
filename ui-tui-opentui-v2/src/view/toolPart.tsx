@@ -148,7 +148,7 @@ export function ToolPart(props: { part: ToolPartState }) {
                 fallback={
                   <For each={(props.part.argsText ?? '').split('\n').slice(0, ARGS_MAX)}>
                     {line => (
-                      <text>
+                      <text selectionBg={theme().color.selectionBg}>
                         <span style={{ fg: theme().color.muted }}>{truncate(line, bodyWidth() - 2)}</span>
                       </text>
                     )}
@@ -157,7 +157,7 @@ export function ToolPart(props: { part: ToolPartState }) {
               >
                 <For each={argEntries().slice(0, ARGS_MAX)}>
                   {([k, v]) => (
-                    <text>
+                    <text selectionBg={theme().color.selectionBg}>
                       <span style={{ fg: theme().color.muted }}>{truncate(argLine(k, v), bodyWidth() - 2)}</span>
                     </text>
                   )}
@@ -176,9 +176,11 @@ export function ToolPart(props: { part: ToolPartState }) {
                 <span style={{ fg: theme().color.label }}>output</span>
               </text>
             </Show>
+            {/* output body lines are the copyable content → themed selection bar
+                (preserves fg; same token as message text) (item: theme highlight). */}
             <For each={body().lines}>
               {line => (
-                <text>
+                <text selectionBg={theme().color.selectionBg}>
                   <span style={{ fg: theme().color.muted }}>{line}</span>
                 </text>
               )}
