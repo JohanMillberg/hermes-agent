@@ -140,16 +140,16 @@ To override: set `proxy.upstream_deny_cidrs` to your own list. To opt out entire
 
 ### Bind policy
 
-The proxy binds **loopback only** (`127.0.0.1:<tunnel_port>`). It does NOT bind `0.0.0.0`. This means:
+The proxy never binds `0.0.0.0`. The default bind is platform-specific because iron-proxy v0.39 supports only a **single bind per daemon process**:
 
-- A LAN peer with a leaked proxy token cannot use it — the proxy is unreachable from the network.
-- Containers reach the proxy via `host.docker.internal:9090`, which Docker maps to the host gateway via `--add-host=host.docker.internal:host-gateway` on Linux. On macOS / Windows Docker Desktop, Desktop manages the gateway itself.
+- **Linux:** the docker bridge gateway (`172.17.0.1:<tunnel_port>` by default). Containers reach the proxy via `host.docker.internal`, which `--add-host=host.docker.internal:host-gateway` resolves to exactly this bridge gateway IP — a loopback-only bind would be unreachable from inside sandboxes. The bridge IP is an address on the host's `docker0` interface, so it is not exposed to the LAN; it IS reachable by other containers on the default bridge network, but requests still require a minted proxy token and an allowlisted upstream. If no docker bridge is detected (docker not installed/running), the bind falls back to loopback with a warning.
+- **macOS / Windows Docker Desktop:** loopback (`127.0.0.1:<tunnel_port>`). Desktop's VPNkit routes `host.docker.internal` to the host, so loopback is reachable from containers and is the least-exposed choice.
 
-iron-proxy v0.39 only supports a single bind per daemon process — earlier drafts of this integration emitted a plural `http_listens` list with the docker bridge IP appended for direct sandbox-to-bridge connectivity, but v0.39's YAML parser rejects that field. The `host.docker.internal -> host-gateway` mapping that Docker provides is sufficient: containers resolve the hostname to the bridge IP, then connect TO the host's loopback bind through it.
+A LAN peer with a leaked proxy token cannot use the proxy — neither bind is reachable from the external network.
 
-We also pin `metrics.listen: 127.0.0.1:0` so the daemon's built-in metrics server gets an ephemeral loopback port instead of its default `:9090` — otherwise it would fight `tunnel_port: 9090` for the same socket and the daemon would refuse to start with "address already in use".
+We also pin `metrics.listen: 127.0.0.1:0` so the daemon's built-in metrics server gets an ephemeral loopback port instead of its default `:9090` — otherwise it would fight `tunnel_port: 9090` for the same socket and the daemon would refuse to start with "address already in use". Note the `:0` ephemeral port is random per start and not surfaced anywhere, so metrics are effectively disabled at this pin.
 
-If a hostile `ip` shim earlier on PATH had been able to inject a non-private IPv4 here (`0.0.0.0`, a public address, multicast, link-local, etc.) the loopback fallback still applies — we never bind anything we couldn't validate via `ipaddress.IPv4Address` + `is_*` checks.
+If a hostile `ip` shim earlier on PATH had been able to inject a non-private IPv4 as the bridge address (`0.0.0.0`, a public address, multicast, link-local, etc.) the loopback fallback still applies — we never bind anything we couldn't validate via `ipaddress.IPv4Address` + `is_*` checks.
 
 ## Uncovered providers
 
@@ -322,7 +322,7 @@ On the currently pinned binary version (**v0.39.0**) iron-proxy writes ALL outpu
 
 We still pre-create `~/.hermes/proxy/audit.log` at `0o600` with `O_NOFOLLOW` because:
 
-1. It serves as a stable logrotate / fluent-bit / monitoring target — operators can wire downstream tooling to that path today, and when we bump the pinned version to one that supports `log.audit_path`, the records will start flowing without any operator-side reconfiguration.
+1. It reserves the path for the future version bump: when the pinned version moves to one that supports `log.audit_path`, per-request records will start flowing there without operator-side reconfiguration. **Until then the file stays at 0 bytes — do not point monitoring, alerting, or forensics tooling at it yet.** Use `iron-proxy.log` for everything today.
 2. The 0o600-from-first-byte guarantee defends against the upstream-fix-day where v0.40+ creates the file under its default umask if it doesn't already exist.
 
 Until that version bump lands, treat `iron-proxy.log` as the source of truth for both audiences:
@@ -369,7 +369,7 @@ When the Docker backend starts a container with `proxy.enabled: true` and the da
 |---|---|
 | `-v ~/.hermes/proxy/ca.crt:/etc/ssl/certs/hermes-egress-ca.crt:ro` | Read-only mount of the CA |
 | `-e HTTPS_PROXY=http://host.docker.internal:9090` | Python httpx / curl / go default transport / Node fetch |
-| `-e HTTP_PROXY=…` | curl + wget for plain HTTP (rare in modern stacks) |
+| `-e HTTP_PROXY=http://host.docker.internal:9091` | curl + wget for plain HTTP — the plain-HTTP forward listener lives on `tunnel_port + 1` |
 | `-e NO_PROXY=127.0.0.1,localhost,::1` | Loopback dev servers inside the sandbox bypass the proxy |
 | `-e REQUESTS_CA_BUNDLE=…ca.crt` | Python `requests` |
 | `-e SSL_CERT_FILE=…ca.crt` | Python `ssl` module / OpenSSL — **replaces** the system store |
@@ -431,7 +431,7 @@ If the nonce check fails, the code falls back to matching `argv[0]` basename aga
 - Agent dialing cloud metadata endpoints (`169.254.169.254`) — iron-proxy denies these by default via `upstream_deny_cidrs`, including the IPv4-mapped-v6 form `::ffff:169.254.169.254`.
 - DNS rebinding through an allowlisted hostname to a private IP — the deny CIDRs are checked at connect time, not at allowlist time.
 - Same-uid local processes reading the iron-proxy daemon's env to scrape secrets — only the env var names referenced by mappings are forwarded, not the full host env.
-- A LAN peer with a leaked sandbox proxy token spending your API quota — the proxy binds loopback only, never `0.0.0.0` (containers reach it via `host.docker.internal -> host-gateway`).
+- A LAN peer with a leaked sandbox proxy token spending your API quota — the proxy binds the docker bridge gateway (Linux) or loopback (Docker Desktop), never `0.0.0.0`, so it is unreachable from the external network.
 
 **What it does NOT protect against:**
 
@@ -484,9 +484,27 @@ Look at the last 20 lines of `~/.hermes/proxy/iron-proxy.log`. Common causes:
 - Invalid `proxy.yaml` → run `hermes egress setup` to regenerate
 - CA cert / key permissions wrong → `chmod 0o600 ~/.hermes/proxy/ca.key`
 
-### "iron-proxy did not bind 127.0.0.1:9090 within 5s"
+### "iron-proxy did not bind \<bind-host\>:9090 within 5s"
 
 The daemon started but never bound the listener. Usually means the binary is wedged or doing something expensive at startup. Check `~/.hermes/proxy/iron-proxy.log`. The orphan process is killed automatically and the pidfile cleaned up so you can just retry `hermes egress start`.
+
+### Sandbox times out connecting to the proxy (Linux)
+
+The container resolves `host.docker.internal` to the docker bridge gateway and the proxy is bound there, but a host firewall (commonly `ufw` with default-deny INPUT) drops container→host traffic on `docker0`. Verify from a container:
+
+```bash
+docker run --rm --add-host host.docker.internal:host-gateway busybox \
+  nc -zv -w 3 host.docker.internal 9090
+```
+
+If that times out while `hermes egress status` shows `listening`, allow the bridge subnet in your firewall, e.g. for ufw:
+
+```bash
+sudo ufw allow in on docker0 to any port 9090 proto tcp
+sudo ufw allow in on docker0 to any port 9091 proto tcp
+```
+
+(9091 = the plain-HTTP forward listener on `tunnel_port + 1`.)
 
 ### Sandbox sees `HTTP 403` from the proxy
 
@@ -553,7 +571,7 @@ Or watch in real-time:
 tail -f ~/.hermes/proxy/iron-proxy.log | jq
 ```
 
-When the pinned version moves to v0.40+ (which adds `log.audit_path`), per-request records will move to `~/.hermes/proxy/audit.log` and `iron-proxy.log` will hold only daemon-level events. The file at `audit.log` is pre-created today at `0o600` so any logrotate / monitoring tooling you wire to that path keeps working through the version bump without operator-side reconfig.
+When the pinned version moves to v0.40+ (which adds `log.audit_path`), per-request records will move to `~/.hermes/proxy/audit.log` and `iron-proxy.log` will hold only daemon-level events. Until that bump, `audit.log` is an empty placeholder (pre-created at `0o600` so the future daemon inherits tight permissions) — wire your logrotate / monitoring tooling to `iron-proxy.log` today and plan to add `audit.log` after the version bump.
 
 ## Limitations (v1)
 
@@ -563,7 +581,7 @@ When the pinned version moves to v0.40+ (which adds `log.audit_path`), per-reque
 - The CA is a 10-year self-signed cert on first generation. Rotation requires `openssl genrsa ...` by hand (or wait for a follow-up that adds `hermes egress rotate-ca`).
 - Token rotation does not auto-restart the daemon; after `--rotate-tokens` you must `hermes egress stop && hermes egress start` and then restart running sandboxes.
 - iron-proxy in-memory secret zeroisation is upstream-controlled. Same-uid attackers with `/proc/<pid>/mem` read access can read swapped-in secrets from the daemon's memory.
-- iron-proxy v0.39 only supports a **single bind per daemon** and combines daemon + per-request records into a single log stream. The integration is designed to upgrade cleanly: the moment upstream adds `proxy.http_listens` (plural) and `log.audit_path`, both wire in automatically without changing operator configs.
+- iron-proxy v0.39 only supports a **single bind per daemon** (we bind the docker bridge gateway on Linux, loopback on Docker Desktop) and combines daemon + per-request records into a single log stream. When upstream adds `proxy.http_listens` (plural) and `log.audit_path`, a version bump can wire in multi-bind and the dedicated audit stream.
 
 ## See also
 

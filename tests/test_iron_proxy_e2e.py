@@ -105,6 +105,11 @@ def test_iron_proxy_swaps_authorization_header_end_to_end(hermes_home, monkeypat
             # Test target is on loopback — clear the default IMDS+loopback
             # deny list so iron-proxy will dial 127.0.0.1.
             upstream_deny_cidrs=[],
+            # Hermetic: pin the bind to loopback.  Without this, Linux
+            # hosts with docker0 present would bind the bridge gateway
+            # (the production default) and the loopback curl below would
+            # never reach the proxy.
+            http_listen=[f"127.0.0.1:{tunnel_port}"],
         )
         ip.write_proxy_config(cfg)
         ip.write_mappings([mapping])
@@ -125,19 +130,17 @@ def test_iron_proxy_swaps_authorization_header_end_to_end(hermes_home, monkeypat
             pytest.fail("iron-proxy never started listening on the tunnel port")
 
         # ----- request through the proxy ----------------------------------
-        # The fake upstream listens on plain HTTP (not HTTPS), so we use the
-        # proxy's tunnel for the CONNECT but talk plaintext to upstream via
-        # `--proxy-insecure` semantics: iron-proxy accepts HTTPS_PROXY-style
-        # CONNECT to any host on its allowlist.  For a clean E2E we hit
-        # http://127.0.0.1:<port>/ which goes through the proxy as a plain
-        # HTTP forward (no MITM needed) and the secrets transform still fires
-        # on the Authorization header.
+        # The fake upstream listens on plain HTTP (not HTTPS).  Plain-HTTP
+        # absolute-form forwards are served by the http_listen listener on
+        # tunnel_port + 1 (tunnel_port itself is the CONNECT/MITM listener
+        # that HTTPS_PROXY traffic hits).  The secrets transform fires on
+        # the plain forward too, swapping the Authorization header.
         result = subprocess.run(
             [
                 "curl",
                 "--silent",
                 "--max-time", "10",
-                "-x", f"http://127.0.0.1:{tunnel_port}",
+                "-x", f"http://127.0.0.1:{tunnel_port + 1}",
                 "-H", f"Authorization: Bearer {proxy_token}",
                 f"http://127.0.0.1:{upstream_port}/",
             ],

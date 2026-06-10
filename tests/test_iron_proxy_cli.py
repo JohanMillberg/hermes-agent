@@ -425,3 +425,88 @@ def test_setup_has_rotate_tokens_flag():
     assert args.rotate_tokens is False
     args = parser.parse_args(["setup", "--rotate-tokens"])
     assert args.rotate_tokens is True
+
+
+# ---------------------------------------------------------------------------
+# v4 round: credential_source=bitwarden with secrets.bitwarden disabled
+# must NOT silently degrade to host-env secrets
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_start_refuses_when_bitwarden_mode_but_disabled(hermes_home, monkeypatch):
+    """config keeps credential_source: bitwarden but secrets.bitwarden.enabled
+    later flips to false — cmd_start must refuse, not silently start on
+    host env (the silent-degrade class strict mode is meant to close)."""
+
+    from hermes_cli.config import load_config, save_config
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["enabled"] = True
+    cfg["proxy"]["credential_source"] = "bitwarden"
+    cfg["proxy"]["fail_on_uncovered_providers"] = False
+    cfg.setdefault("secrets", {})["bitwarden"] = {"enabled": False}
+    save_config(cfg)
+
+    def must_not_call(**kw):
+        pytest.fail("start_proxy must not run when bitwarden mode is broken")
+    monkeypatch.setattr(ip, "start_proxy", must_not_call)
+    monkeypatch.setattr(ip, "discover_uncovered_providers", lambda **kw: [])
+    monkeypatch.setattr(ip, "discover_blocked_providers", lambda **kw: [])
+
+    rc = proxy_cli.cmd_start(_args())
+    assert rc == 1
+
+
+def test_cmd_start_bitwarden_disabled_proceeds_with_env_fallback(
+    hermes_home, monkeypatch,
+):
+    """Same scenario but proxy.allow_env_fallback=true is the documented
+    escape hatch — start proceeds (with a warning)."""
+
+    from hermes_cli.config import load_config, save_config
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["enabled"] = True
+    cfg["proxy"]["credential_source"] = "bitwarden"
+    cfg["proxy"]["allow_env_fallback"] = True
+    cfg["proxy"]["fail_on_uncovered_providers"] = False
+    cfg.setdefault("secrets", {})["bitwarden"] = {"enabled": False}
+    save_config(cfg)
+
+    captured: dict = {}
+
+    def fake_start_proxy(**kw):
+        captured.update(kw)
+        s = ip.ProxyStatus()
+        s.pid = 4242
+        s.listening = True
+        return s
+
+    monkeypatch.setattr(ip, "start_proxy", fake_start_proxy)
+    monkeypatch.setattr(ip, "discover_uncovered_providers", lambda **kw: [])
+    monkeypatch.setattr(ip, "discover_blocked_providers", lambda **kw: [])
+
+    rc = proxy_cli.cmd_start(_args())
+    assert rc == 0
+    # BW refresh is off (bitwarden disabled), running on env secrets.
+    assert captured.get("refresh_secrets_from_bitwarden") is False
+
+
+def test_cmd_setup_audit_log_failure_is_warning_not_abort(hermes_home, monkeypatch):
+    """On the pinned v0.39 the daemon never writes audit.log, so a
+    pre-create failure must not abort the wizard."""
+
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
+    monkeypatch.setattr(ip, "discover_provider_mappings", lambda **kw: [
+        ip.TokenMapping(
+            proxy_token="hermes-proxy-deadbeef",
+            real_env_name="OPENROUTER_API_KEY",
+            upstream_hosts=("openrouter.ai",),
+        ),
+    ])
+    monkeypatch.setattr(ip, "discover_uncovered_providers", lambda **kw: [])
+
+    def boom(path):
+        raise RuntimeError("could not pre-create audit log (synthetic)")
+    monkeypatch.setattr(ip, "ensure_audit_log", boom)
+
+    rc = proxy_cli.cmd_setup(_args())
+    assert rc == 0

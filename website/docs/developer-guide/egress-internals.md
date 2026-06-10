@@ -124,7 +124,7 @@ hermes egress start
             Poll loop (do-while shape):
               while True:
                 if proc.poll() is not None: tail log + unlink pidfile + raise
-                if _port_listening("127.0.0.1", tunnel_port): break
+                if _port_listening(probe_host, tunnel_port): break  # probe_host = configured bind host
                 if time.time() >= deadline: break  (do-while: checked AFTER first probe)
                 time.sleep(0.1)
             If not listening at exit: _kill_and_wait(proc) + unlink pidfile + raise.
@@ -169,13 +169,15 @@ Regression: `test_subprocess_env_strips_unrelated_secrets`, `test_subprocess_env
 
 ### Bind policy
 
-`_default_http_listen` returns loopback (and, on Linux, the docker bridge IP as a *second list entry the rendered yaml currently discards* — see below).  Never `0.0.0.0`, never `:PORT` (INADDR_ANY).
+`_default_http_listen` returns a single-element list: on Linux the docker bridge gateway IP (containers reach the proxy via `host.docker.internal:host-gateway`, which resolves to the bridge gateway — a loopback bind is unreachable from inside containers there); on macOS/Windows Docker Desktop, loopback (VPNkit routes `host.docker.internal` to the host).  Linux without a detectable docker0 bridge falls back to loopback with a warning.  Never `0.0.0.0`, never `:PORT` (INADDR_ANY).
 
 `_detect_docker_bridge_ip` validates via `ipaddress.IPv4Address` and rejects `is_unspecified` / `is_loopback` / `is_multicast` / `is_reserved` / `is_link_local` / `is_global`.  A hostile `ip` shim on PATH cannot inject `0.0.0.0`.
 
-**v0.39 schema constraint:** the binary's `config.Proxy` struct has only a singular `http_listen` string field — there is no `http_listens` (plural) list, despite earlier comments in this module claiming otherwise.  `build_proxy_config` emits only the first entry of `_default_http_listen`'s result; the second-bind path is dead code today.  When the pinned `_IRON_PROXY_VERSION` is bumped to one that supports the plural form, re-enable the list-emit in `build_proxy_config` and the docker-bridge bind becomes live without further changes.
+**v0.39 schema constraint and listener roles (verified live against the binary):** the binary's `config.Proxy` struct has only singular listener fields — there is no `http_listens` (plural) list.  `tunnel_listen` is the CONNECT + MITM listener (what `HTTPS_PROXY` traffic hits); `http_listen` only handles absolute-form plain-HTTP forwards (a CONNECT sent to it is relayed upstream as a regular request and 400s).  `build_proxy_config` therefore binds `tunnel_listen` on `tunnel_port` and `http_listen` on `tunnel_port + 1`, both on the platform bind host.  The Docker backend sets `HTTPS_PROXY` to `tunnel_port` and `HTTP_PROXY` to `tunnel_port + 1`.
 
-Regression: `test_default_bind_is_loopback_not_zero_zero` (asserts loopback bind AND that `http_listens` is NOT in the rendered yaml), `test_default_bind_uses_loopback_on_linux`, `test_detect_docker_bridge_ip_rejects_dangerous` (parametrized over 8 attack inputs).
+The liveness probes (`start_proxy` poll loop, `get_status`) read the configured bind host via `_read_http_listen_from_config()` and probe THAT host — a hardcoded loopback probe would report a healthy bridge-bound daemon as dead.
+
+Regression: `test_default_bind_is_loopback_not_zero_zero` (asserts no INADDR_ANY AND that `http_listens` is NOT in the rendered yaml), `test_default_bind_uses_docker_bridge_on_linux`, `test_default_bind_falls_back_to_loopback_without_bridge`, `test_default_bind_is_loopback_on_macos`, `test_detect_docker_bridge_ip_rejects_dangerous` (parametrized over 8 attack inputs).
 
 ### Metrics port collision
 
@@ -191,7 +193,7 @@ Regression: `test_default_deny_cidrs_present_when_unspecified`, `test_default_de
 
 ### Audit log fail-loud
 
-`ensure_audit_log` raises `RuntimeError` on any `OSError`.  Swallowing the failure would let the daemon create the file under the default umask, defeating the privacy promise.  `cmd_setup` catches the RuntimeError and surfaces a clear error to the operator.
+`ensure_audit_log` raises `RuntimeError` on any `OSError`.  On the pinned v0.39 the daemon never writes this file (no `log.audit_path` field), so `cmd_setup` treats the failure as a WARNING (the file is non-load-bearing until the version bump) and qualifies the success line as "reserved".  When the pin moves to a version with `log.audit_path`, revisit: the pre-create becomes load-bearing for the 0o600-from-first-byte guarantee and the wizard should fail loud again.
 
 **v0.39 schema constraint:** `log.audit_path` is NOT a field in iron-proxy v0.39's `config.Log` struct, so `build_proxy_config` accepts the `audit_log` kwarg but does NOT emit it into the rendered yaml.  Per-request records on v0.39 land in `iron-proxy.log` alongside daemon-level events.  The `audit.log` file is still pre-created at `0o600` with `O_NOFOLLOW` so the privacy contract holds when the pinned version is bumped to one that supports the separate stream.
 

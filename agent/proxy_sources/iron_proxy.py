@@ -37,8 +37,10 @@ Design summary
   at proxy startup instead.
 
 * The proxy runs as a managed subprocess (``hermes egress start``), pidfile
-  at ``<hermes_home>/proxy/iron-proxy.pid``, structured audit log at
-  ``<hermes_home>/proxy/audit.log``.
+  at ``<hermes_home>/proxy/iron-proxy.pid``.  Daemon output (including
+  per-request records on v0.39) goes to ``<hermes_home>/proxy/iron-proxy.log``;
+  ``audit.log`` is pre-created but reserved for a future pin that supports
+  ``log.audit_path``.
 
 * Failures (binary missing, port collision, bad config) emit a one-line
   warning and do *not* block agent startup.  The Docker backend refuses to
@@ -686,26 +688,44 @@ def mint_proxy_token(prefix: str = "hermes-proxy") -> str:
 
 
 def _default_http_listen(tunnel_port: int) -> List[str]:
-    """Build the list of host:port pairs the proxy should bind on.
+    """Build the single host:port bind the proxy should listen on.
 
-    Always binds loopback (``127.0.0.1``) so host-side test tooling can hit
-    the proxy directly.  On Linux we also bind the docker bridge gateway
-    (``172.17.0.1`` by default) so containers can reach the proxy via
-    ``host.docker.internal:host-gateway``.  We do NOT bind ``0.0.0.0`` —
-    that would expose the proxy (and, with a leaked sandbox token, the
-    user's API quota) to anyone on the local network.
+    iron-proxy v0.39 supports exactly ONE ``proxy.http_listen`` bind per
+    daemon process, so this returns a one-element list and the choice of
+    host matters:
 
-    On macOS / Windows Docker Desktop the bridge gateway is managed by
-    Desktop itself and ``host.docker.internal`` resolves via VPNkit, so
-    a single loopback bind is enough.
+    * **Linux:** bind the docker bridge gateway (``172.17.0.1`` by
+      default).  Sandboxes reach the proxy via
+      ``host.docker.internal:host-gateway``, which Docker resolves to
+      exactly this bridge gateway IP on Linux — a loopback-only bind is
+      unreachable from inside containers there.  The bridge IP is still
+      host-local (it's an address on the host's ``docker0`` interface),
+      so host-side tooling and the status probe can reach it too.  When
+      no docker bridge is detected (docker not installed / not started),
+      fall back to loopback — there are no sandboxes to serve in that
+      state, and the operator gets a warning.
+    * **macOS / Windows Docker Desktop:** ``host.docker.internal``
+      resolves via VPNkit to the host, so a loopback bind is reachable
+      from containers and is the least-exposed choice.
+
+    We never bind ``0.0.0.0`` — that would expose the proxy (and, with a
+    leaked sandbox token, the user's API quota) to anyone on the local
+    network.  The bridge-gateway bind is reachable by other containers
+    on the default bridge network, which is unavoidable given v0.39's
+    single-bind limit; requests still require a minted proxy token and
+    an allowlisted upstream.
     """
 
-    binds = [f"127.0.0.1:{tunnel_port}"]
     if platform.system() == "Linux":
         bridge_ip = _detect_docker_bridge_ip()
         if bridge_ip and bridge_ip != "127.0.0.1":
-            binds.append(f"{bridge_ip}:{tunnel_port}")
-    return binds
+            return [f"{bridge_ip}:{tunnel_port}"]
+        logger.warning(
+            "No docker bridge (docker0) detected — binding iron-proxy to "
+            "loopback only.  Docker sandboxes will NOT be able to reach "
+            "the proxy until it is restarted with docker running."
+        )
+    return [f"127.0.0.1:{tunnel_port}"]
 
 
 def _detect_docker_bridge_ip() -> Optional[str]:
@@ -792,13 +812,14 @@ def build_proxy_config(
     real secrets from its OWN environment via ``source: {type: env, var: ...}``;
     the sandbox never sees them.
 
-    Bind policy: by default we bind loopback (``127.0.0.1``) plus the
-    docker bridge gateway IP on Linux (``172.17.0.1`` or whatever
-    ``docker0`` resolves to).  Sandboxes use ``host.docker.internal`` which
-    Linux Docker maps to the bridge gateway via ``--add-host``; macOS /
-    Windows Docker Desktop manage their own gateway.  We do NOT bind
-    ``0.0.0.0`` — a LAN peer with a leaked sandbox token could otherwise
-    spend the operator's API quota against any allowlisted upstream.
+    Bind policy: the sandbox-facing listeners (``tunnel_listen`` on
+    ``tunnel_port``, plain-HTTP ``http_listen`` on ``tunnel_port + 1``)
+    bind the docker bridge gateway on Linux (``172.17.0.1`` or whatever
+    ``docker0`` resolves to — that's what ``host.docker.internal``
+    resolves to inside containers there) and loopback on macOS / Windows
+    Docker Desktop.  We do NOT bind ``0.0.0.0`` — a LAN peer with a
+    leaked sandbox token could otherwise spend the operator's API quota
+    against any allowlisted upstream.
 
     SSRF policy: ``upstream_deny_cidrs`` defaults to a conservative deny
     list covering loopback, link-local (incl. AWS/GCP/Azure IMDS at
@@ -851,16 +872,34 @@ def build_proxy_config(
     else:
         deny_cidrs = list(upstream_deny_cidrs)
 
-    # Listen address.  iron-proxy v0.39 takes a single string at
-    # ``proxy.http_listen`` — there is no plural ``http_listens`` field,
-    # despite earlier drafts of this module claiming v0.39 accepts both.
-    # An empirical strings(1) audit + a live "start the binary and
-    # observe the YAML unmarshal error" confirms the singular form is
-    # the only one the binary accepts.  We bind loopback by default; the
-    # docker bridge listener is added as a second binary invocation if
-    # we ever need multi-bind, but a single bind is what v0.39 supports.
+    # Listen addresses.  iron-proxy v0.39 takes a single string per
+    # listener field — there is no plural ``http_listens`` form, despite
+    # earlier drafts of this module claiming v0.39 accepts both.  An
+    # empirical strings(1) audit + a live "start the binary and observe
+    # the YAML unmarshal error" confirms the singular form is the only
+    # one the binary accepts.
+    #
+    # LISTENER ROLES (verified live against the v0.39 binary):
+    # * ``tunnel_listen`` is the CONNECT + MITM listener.  HTTPS through
+    #   ``HTTPS_PROXY`` issues CONNECT — this is the listener sandboxes
+    #   must reach.  A CONNECT sent to ``http_listen`` is NOT terminated:
+    #   v0.39 forwards it upstream as a regular request and the upstream
+    #   responds 400.
+    # * ``http_listen`` is the absolute-form plain-HTTP forward listener
+    #   (``HTTP_PROXY`` for ``http://`` URLs).  Transforms fire here too.
+    # Both get the sandbox-facing bind host: tunnel on ``tunnel_port``,
+    # plain HTTP on ``tunnel_port + 1``.
+    #
+    # The bind host comes from _default_http_listen: the docker bridge
+    # gateway on Linux (containers reach the proxy via
+    # host.docker.internal, which maps to the bridge gateway there —
+    # loopback would be unreachable from inside sandboxes) and loopback
+    # on macOS/Windows Docker Desktop (where host.docker.internal routes
+    # to the host via VPNkit).
     listens = list(http_listen) if http_listen else _default_http_listen(tunnel_port)
     primary_listen = listens[0] if listens else f"127.0.0.1:{tunnel_port}"
+    bind_host = primary_listen.rsplit(":", 1)[0] or "127.0.0.1"
+    plain_http_listen = f"{bind_host}:{tunnel_port + 1}"
 
     log_block: Dict = {"level": "info"}
     # NOTE: ``log.audit_path`` is NOT a field in iron-proxy v0.39's
@@ -888,19 +927,20 @@ def build_proxy_config(
             "proxy_ip": "127.0.0.1",
         },
         "proxy": {
-            # http_listen is the HTTP-proxy listener that handles both plain
-            # HTTP forwards AND CONNECT tunnels for HTTPS.  Sandboxes set
-            # `HTTPS_PROXY=http://host:tunnel_port` and the same listener
-            # serves both protocols.  We bind loopback by default — NOT
-            # 0.0.0.0.  LAN peers with a leaked sandbox token would
-            # otherwise be able to spend the operator's API quota against
-            # any allowlisted upstream.
-            "http_listen": primary_listen,
-            # The HTTPS-listener (direct TLS termination, no CONNECT) and
-            # the SOCKS5/CONNECT-only tunnel listener get loopback ephemeral
-            # ports — we don't expose them.
+            # tunnel_listen is the CONNECT/MITM listener — what sandboxes
+            # hit via `HTTPS_PROXY=http://host:tunnel_port` for HTTPS
+            # upstreams (curl/requests/node issue CONNECT through it).
+            # http_listen handles absolute-form plain-HTTP forwards
+            # (`HTTP_PROXY` for http:// URLs) on tunnel_port+1.  Both
+            # bind the docker bridge gateway on Linux / loopback on
+            # Docker Desktop — NEVER 0.0.0.0.  LAN peers with a leaked
+            # sandbox token would otherwise be able to spend the
+            # operator's API quota against any allowlisted upstream.
+            "tunnel_listen": primary_listen,
+            "http_listen": plain_http_listen,
+            # The HTTPS-listener (direct TLS termination, no CONNECT)
+            # gets a loopback ephemeral port — we don't expose it.
             "https_listen": "127.0.0.1:0",
-            "tunnel_listen": "127.0.0.1:0",
             "max_request_body_bytes": 16 * 1024 * 1024,
             "max_response_body_bytes": 0,
             "upstream_response_header_timeout": "120s",
@@ -914,9 +954,11 @@ def build_proxy_config(
         # startup.  Pin the metrics listener to an ephemeral loopback
         # port (``127.0.0.1:0``) so the metrics binding can't collide
         # with the proxy listener regardless of what tunnel_port the
-        # operator chose.  The daemon still emits metrics for any local
-        # scraper that knows where to look (via ``hermes egress
-        # status``); we just don't expose them to the public default.
+        # operator chose.  NOTE: ``:0`` means the kernel picks a fresh
+        # random port each start and nothing records it — metrics are
+        # effectively disabled/undiscoverable at this pin.  If we want
+        # scrapable metrics later, allocate a fixed port and surface it
+        # in ``ProxyStatus`` / ``hermes egress status``.
         "metrics": {
             "listen": "127.0.0.1:0",
         },
@@ -943,20 +985,19 @@ def build_proxy_config(
 def ensure_audit_log(audit_path: Path) -> None:
     """Create the audit log file with private permissions (0o600).
 
-    Called from the wizard right before ``start_proxy``.  Without this,
-    iron-proxy creates the file under the default umask the first time it
-    writes — meaning every host-side request history is potentially
-    world-readable.  We pre-create the file empty with 0o600 so the daemon
-    inherits the tight permissions.
+    Called from the wizard right before ``start_proxy``.  On the pinned
+    v0.39 the daemon never writes this file (no ``log.audit_path``
+    config field), so the pre-create is purely forward-compat: when the
+    pin moves to a version that supports a dedicated audit stream, the
+    file already exists with tight permissions and the daemon inherits
+    them instead of creating it under the default umask.
 
     Raises :class:`RuntimeError` on any OSError (planted symlink,
-    immutable parent dir, full disk).  The previous version of this
-    function logged a warning and returned silently — that's the bad
-    option, because the docstring's promise of "iron-proxy inherits
-    tight permissions" depends on us actually creating the file.  When
-    the create fails, the caller MUST know about it so the wizard can
-    surface a clear error instead of printing "✓ audit log: ..." for a
-    file the daemon will create under the default umask.
+    immutable parent dir, full disk) so the caller can decide how to
+    surface it.  The wizard treats this as a WARNING on v0.39 — the
+    file is non-load-bearing until the version bump — but the qualified
+    message keeps operators from wiring monitoring to a path that can't
+    exist.
     """
 
     try:
@@ -1509,7 +1550,16 @@ def start_proxy(
     # We scope a Ctrl-C handler around the poll loop so an operator who
     # hits Ctrl-C while waiting for ``hermes egress start`` doesn't leak
     # an orphan with the port bound.
-    tunnel_port = _read_tunnel_port_from_config() or _DEFAULT_TUNNEL_PORT
+    #
+    # Probe the CONFIGURED bind host, not loopback unconditionally — on
+    # Linux the daemon binds the docker bridge gateway, where a loopback
+    # connect never succeeds and we'd kill a healthy daemon as "never
+    # came up".
+    listen_hp = _read_http_listen_from_config()
+    if listen_hp is not None:
+        probe_host, tunnel_port = listen_hp
+    else:
+        probe_host, tunnel_port = "127.0.0.1", _DEFAULT_TUNNEL_PORT
     listening = False
 
     def _interrupt_handler(_signum, _frame):  # pragma: no cover - signal path
@@ -1546,7 +1596,7 @@ def start_proxy(
                     f"iron-proxy exited immediately (code {proc.returncode}). "
                     f"Last log lines:\n{tail}"
                 )
-            if _port_listening("127.0.0.1", tunnel_port):
+            if _port_listening(probe_host, tunnel_port):
                 listening = True
                 break
             if time.time() >= deadline:
@@ -1582,7 +1632,7 @@ def start_proxy(
         except FileNotFoundError:
             pass
         raise RuntimeError(
-            f"iron-proxy did not bind 127.0.0.1:{tunnel_port} within "
+            f"iron-proxy did not bind {probe_host}:{tunnel_port} within "
             f"{_STARTUP_GRACE_SECONDS}s.  Process was killed.  "
             f"Last log lines:\n{tail}"
         )
@@ -1758,14 +1808,24 @@ def _build_proxy_subprocess_env(
                     # selected.  An operator on credential_source=bitwarden
                     # picked it specifically to get rotation; falling back
                     # to parent env reintroduces the bug class the mode
-                    # is supposed to defeat.
-                    raise RuntimeError(
-                        f"Bitwarden refresh did not return secrets for "
-                        f"{missing}.  Either add the secrets to your BWS "
-                        f"project, switch to credential_source: env via "
-                        f"`hermes egress setup --no-bitwarden`, or set "
-                        f"`proxy.allow_env_fallback: true` in config.yaml "
-                        f"to opt into the legacy host-env fallback."
+                    # is supposed to defeat.  ``allow_env_fallback`` is the
+                    # documented, deliberate opt-out — honor it here exactly
+                    # as the empty-token branch below does (the error
+                    # message tells operators to set it, so it must work).
+                    if not (bitwarden_config or {}).get("allow_env_fallback"):
+                        raise RuntimeError(
+                            f"Bitwarden refresh did not return secrets for "
+                            f"{missing}.  Either add the secrets to your BWS "
+                            f"project, switch to credential_source: env via "
+                            f"`hermes egress setup --no-bitwarden`, or set "
+                            f"`proxy.allow_env_fallback: true` in config.yaml "
+                            f"to opt into the legacy host-env fallback."
+                        )
+                    logger.warning(
+                        "Bitwarden refresh did not return secrets for %s — "
+                        "falling back to host env for those names "
+                        "(allow_env_fallback=true).",
+                        missing,
                     )
                 # bws warnings are non-secret status messages (e.g. "no
                 # project found", "rate limited"), but the taint analyzer
@@ -1897,7 +1957,12 @@ def get_status() -> ProxyStatus:
     """
 
     status = ProxyStatus()
-    status.tunnel_port = _read_tunnel_port_from_config() or _DEFAULT_TUNNEL_PORT
+    listen_hp = _read_http_listen_from_config()
+    if listen_hp is not None:
+        probe_host, status.tunnel_port = listen_hp
+    else:
+        probe_host = "127.0.0.1"
+        status.tunnel_port = _DEFAULT_TUNNEL_PORT
 
     binary = find_iron_proxy(install_if_missing=False)
     if binary:
@@ -1918,12 +1983,33 @@ def get_status() -> ProxyStatus:
     pid = _read_pid()
     if pid and _pid_alive(pid):
         status.pid = pid
-        status.listening = _port_listening("127.0.0.1", status.tunnel_port)
+        # Probe the configured bind host — on Linux that's the docker
+        # bridge gateway, where a loopback connect would report a healthy
+        # daemon as "not listening".
+        status.listening = _port_listening(probe_host, status.tunnel_port)
 
     return status
 
 
 def _read_tunnel_port_from_config() -> Optional[int]:
+    listen = _read_http_listen_from_config()
+    if listen is None:
+        return None
+    return listen[1]
+
+
+def _read_http_listen_from_config() -> Optional[Tuple[str, int]]:
+    """Return ``(host, port)`` of the configured sandbox-facing listener.
+
+    Reads ``proxy.tunnel_listen`` — the CONNECT/MITM listener sandboxes
+    hit via ``HTTPS_PROXY`` — falling back to ``proxy.http_listen`` for
+    configs written before the tunnel/http listener-role split.
+
+    The bind host matters for liveness probes: on Linux the daemon binds
+    the docker bridge gateway (e.g. ``172.17.0.1``), where a loopback
+    connect would report "not listening" for a perfectly healthy daemon.
+    """
+
     cfg = _proxy_state_dir_ro() / "proxy.yaml"
     if not cfg.exists():
         return None
@@ -1935,17 +2021,20 @@ def _read_tunnel_port_from_config() -> Optional[int]:
         data = yaml.safe_load(cfg.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError):
         return None
+    proxy_block = (data or {}).get("proxy") or {}
     # The CLI/Docker side calls this "the tunnel port" because that's how
-    # sandboxes use it (HTTPS_PROXY), but on the iron-proxy side it's the
-    # http_listen — the HTTP-proxy listener handles both plain HTTP and the
-    # CONNECT method for HTTPS upstreams.
-    listen = ((data or {}).get("proxy") or {}).get("http_listen") or ""
+    # sandboxes use it (HTTPS_PROXY) — on the iron-proxy side it's the
+    # tunnel_listen (CONNECT + MITM).  http_listen is the plain-HTTP
+    # forward listener on tunnel_port+1.
+    listen = proxy_block.get("tunnel_listen") or proxy_block.get("http_listen") or ""
     if not isinstance(listen, str) or ":" not in listen:
         return None
+    host, _, port_s = listen.rpartition(":")
     try:
-        return int(listen.rsplit(":", 1)[1])
+        port = int(port_s)
     except ValueError:
         return None
+    return (host or "127.0.0.1", port)
 
 
 def _port_listening(host: str, port: int) -> bool:

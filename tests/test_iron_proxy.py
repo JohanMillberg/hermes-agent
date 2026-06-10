@@ -212,8 +212,8 @@ def test_wizard_rendered_yaml_contains_deny_list(hermes_home, tmp_path):
 
 
 def test_default_bind_is_loopback_not_zero_zero(tmp_path):
-    """``http_listen`` must NOT be ``0.0.0.0:PORT`` or ``:PORT`` (latter is
-    INADDR_ANY).  Loopback only by default."""
+    """The sandbox-facing listeners must NOT be ``0.0.0.0:PORT`` or
+    ``:PORT`` (latter is INADDR_ANY)."""
 
     cfg = ip.build_proxy_config(
         mappings=[_sample_mapping()],
@@ -222,12 +222,16 @@ def test_default_bind_is_loopback_not_zero_zero(tmp_path):
         tunnel_port=12345,
         http_listen=["127.0.0.1:12345"],  # explicit so test is deterministic
     )
-    primary = cfg["proxy"]["http_listen"]
-    assert primary == "127.0.0.1:12345"
-    # Sentinel: confirm we didn't accidentally serialize a bare-port form
-    # like ":12345" (that's INADDR_ANY).
-    assert not primary.startswith(":")
-    assert "0.0.0.0" not in primary
+    # tunnel_listen is the CONNECT/MITM listener sandboxes hit via
+    # HTTPS_PROXY; http_listen is the plain-HTTP forward on port+1.
+    assert cfg["proxy"]["tunnel_listen"] == "127.0.0.1:12345"
+    assert cfg["proxy"]["http_listen"] == "127.0.0.1:12346"
+    for key in ("tunnel_listen", "http_listen", "https_listen"):
+        val = cfg["proxy"][key]
+        # Sentinel: confirm we didn't accidentally serialize a bare-port
+        # form like ":12345" (that's INADDR_ANY).
+        assert not val.startswith(":")
+        assert "0.0.0.0" not in val
     # iron-proxy v0.39 doesn't support http_listens (plural).  We
     # deliberately do NOT emit that key — re-emitting it would cause
     # the daemon to fail YAML unmarshal at start time.
@@ -237,14 +241,14 @@ def test_default_bind_is_loopback_not_zero_zero(tmp_path):
     )
 
 
-def test_default_bind_uses_loopback_on_linux(tmp_path, monkeypatch):
+def test_default_bind_uses_docker_bridge_on_linux(tmp_path, monkeypatch):
     """When http_listen isn't passed AND we're on Linux, the singular
-    http_listen field is the loopback bind.  iron-proxy v0.39 only
-    supports one bind per daemon process — earlier versions of this
-    code emitted a plural http_listens list with the docker bridge
-    appended, but v0.39 rejects that key so we keep loopback only.
-    Sandboxes still reach the daemon via host.docker.internal which
-    Docker maps to the host gateway, so loopback-only is functional."""
+    http_listen field is the DOCKER BRIDGE bind — not loopback.
+    iron-proxy v0.39 only supports one bind per daemon process, and on
+    Linux ``host.docker.internal:host-gateway`` resolves to the bridge
+    gateway (172.17.0.1 by default), which a loopback-only daemon never
+    answers.  Sandboxes must be able to reach the proxy from the
+    container's vantage point."""
 
     monkeypatch.setattr(ip.platform, "system", lambda: "Linux")
     monkeypatch.setattr(ip, "_detect_docker_bridge_ip", lambda: "172.17.0.1")
@@ -254,10 +258,46 @@ def test_default_bind_uses_loopback_on_linux(tmp_path, monkeypatch):
         ca_key=tmp_path / "ca.key",
         tunnel_port=9090,
     )
-    # Primary http_listen is loopback.
-    assert cfg["proxy"]["http_listen"] == "127.0.0.1:9090"
+    # The sandbox-facing CONNECT/MITM listener binds the bridge gateway —
+    # reachable from containers via host.docker.internal.  Plain-HTTP
+    # forward listener rides on port+1, same host.
+    assert cfg["proxy"]["tunnel_listen"] == "172.17.0.1:9090"
+    assert cfg["proxy"]["http_listen"] == "172.17.0.1:9091"
     # No http_listens (plural) — v0.39 rejects that key.
     assert "http_listens" not in cfg["proxy"]
+
+
+def test_default_bind_falls_back_to_loopback_without_bridge(tmp_path, monkeypatch):
+    """On Linux without a detectable docker0 bridge (docker not
+    installed / not running), fall back to loopback rather than
+    refusing to bind."""
+
+    monkeypatch.setattr(ip.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(ip, "_detect_docker_bridge_ip", lambda: None)
+    cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+        tunnel_port=9090,
+    )
+    assert cfg["proxy"]["tunnel_listen"] == "127.0.0.1:9090"
+    assert cfg["proxy"]["http_listen"] == "127.0.0.1:9091"
+
+
+def test_default_bind_is_loopback_on_macos(tmp_path, monkeypatch):
+    """On Docker Desktop platforms host.docker.internal routes to the
+    host via VPNkit, so loopback is reachable from containers and is
+    the least-exposed bind."""
+
+    monkeypatch.setattr(ip.platform, "system", lambda: "Darwin")
+    cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+        tunnel_port=9090,
+    )
+    assert cfg["proxy"]["tunnel_listen"] == "127.0.0.1:9090"
+    assert cfg["proxy"]["http_listen"] == "127.0.0.1:9091"
 
 
 def test_metrics_listener_pinned_to_loopback_ephemeral(tmp_path):
@@ -1455,3 +1495,102 @@ def test_persisted_nonce_roundtrip(hermes_home, monkeypatch):
 def test_persisted_nonce_returns_none_when_missing(hermes_home):
     """No nonce file → None, callers fall back to argv0 basename."""
     assert ip._read_persisted_nonce() is None
+
+
+# ---------------------------------------------------------------------------
+# v4 round (GodsBoy follow-up): bind-host-aware liveness probes +
+# allow_env_fallback on the partial-secret path
+# ---------------------------------------------------------------------------
+
+
+def test_read_http_listen_from_config_returns_host_and_port(hermes_home):
+    """_read_http_listen_from_config must surface the BIND HOST, not just
+    the port — on Linux the daemon binds the docker bridge gateway and a
+    hardcoded loopback probe would report a healthy daemon as dead."""
+
+    state = ip._proxy_state_dir()
+    (state / "proxy.yaml").write_text(
+        "proxy:\n  http_listen: 172.17.0.1:9090\n", encoding="utf-8"
+    )
+    assert ip._read_http_listen_from_config() == ("172.17.0.1", 9090)
+    assert ip._read_tunnel_port_from_config() == 9090
+
+
+def test_read_http_listen_from_config_missing_file(hermes_home):
+    assert ip._read_http_listen_from_config() is None
+
+
+def test_get_status_probes_configured_bind_host(hermes_home, monkeypatch):
+    """get_status must probe the configured bind host (e.g. the docker
+    bridge IP), not loopback unconditionally."""
+
+    state = ip._proxy_state_dir()
+    (state / "proxy.yaml").write_text(
+        "proxy:\n  http_listen: 172.17.0.1:9123\n", encoding="utf-8"
+    )
+    (state / "ca.crt").write_text("cert")
+    ip._write_pidfile_safely(ip._pidfile(), 99999)
+    monkeypatch.setattr(ip, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: None)
+
+    probed = {}
+
+    def fake_probe(host, port):
+        probed["host"] = host
+        probed["port"] = port
+        return True
+
+    monkeypatch.setattr(ip, "_port_listening", fake_probe)
+    status = ip.get_status()
+    assert probed == {"host": "172.17.0.1", "port": 9123}
+    assert status.listening is True
+    assert status.tunnel_port == 9123
+
+
+def test_partial_bitwarden_secrets_honor_allow_env_fallback(
+    hermes_home, monkeypatch,
+):
+    """The missing-secret branch's own error message tells operators to
+    set proxy.allow_env_fallback — so the flag must actually work there
+    (previously only the empty-token branch honored it)."""
+
+    ip.write_mappings([_sample_mapping("OPENROUTER_API_KEY")])
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-host-fallback")
+
+    import agent.secret_sources.bitwarden as bw
+    monkeypatch.setattr(
+        bw, "fetch_bitwarden_secrets", lambda **kw: ({}, []),
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+    bw_cfg = {
+        "project_id": "proj",
+        "access_token_env": "BWS_ACCESS_TOKEN",
+        "allow_env_fallback": True,
+    }
+
+    env = ip._build_proxy_subprocess_env(
+        refresh_from_bitwarden=True, bitwarden_config=bw_cfg,
+    )
+    # Falls back to the host env value instead of raising.
+    assert env.get("OPENROUTER_API_KEY") == "sk-host-fallback"
+
+
+def test_partial_bitwarden_secrets_raise_without_fallback(
+    hermes_home, monkeypatch,
+):
+    """Strict default: missing BWS secrets raise."""
+
+    ip.write_mappings([_sample_mapping("OPENROUTER_API_KEY")])
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-host")
+
+    import agent.secret_sources.bitwarden as bw
+    monkeypatch.setattr(
+        bw, "fetch_bitwarden_secrets", lambda **kw: ({}, []),
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+    bw_cfg = {"project_id": "proj", "access_token_env": "BWS_ACCESS_TOKEN"}
+
+    with pytest.raises(RuntimeError, match="did not return secrets"):
+        ip._build_proxy_subprocess_env(
+            refresh_from_bitwarden=True, bitwarden_config=bw_cfg,
+        )

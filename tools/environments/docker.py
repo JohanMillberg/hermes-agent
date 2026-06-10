@@ -449,15 +449,18 @@ def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str
     container_ca = "/etc/ssl/certs/hermes-egress-ca.crt"
     volume_args = ["-v", f"{status.ca_cert_path}:{container_ca}:ro"]
 
+    # tunnel_port serves CONNECT (HTTPS); the plain-HTTP forward listener
+    # is on tunnel_port + 1 (see build_proxy_config's listener-role notes).
     proxy_url = f"http://host.docker.internal:{status.tunnel_port}"
+    plain_http_url = f"http://host.docker.internal:{status.tunnel_port + 1}"
     env_overrides: dict[str, str] = {
         # HTTPS_PROXY / HTTP_PROXY are respected by curl, requests, urllib,
         # httpx, node fetch, go default transport, etc.  Lowercase variants
         # are also set because some tools only look at one casing.
         "HTTPS_PROXY": proxy_url,
         "https_proxy": proxy_url,
-        "HTTP_PROXY": proxy_url,
-        "http_proxy": proxy_url,
+        "HTTP_PROXY": plain_http_url,
+        "http_proxy": plain_http_url,
         # Loopback-only NO_PROXY so localhost dev servers inside the sandbox
         # (test fixtures, local LLMs) don't get sent through the proxy.
         "NO_PROXY": "127.0.0.1,localhost,::1",

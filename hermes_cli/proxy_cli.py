@@ -351,17 +351,19 @@ def cmd_setup(args: argparse.Namespace) -> int:
     ]
 
     audit_log_path = ip._proxy_state_dir() / "audit.log"
-    # Pre-create the audit log with 0o600 so iron-proxy inherits private
-    # perms instead of letting the daemon create it under the default
-    # umask (potentially world-readable).  Raises on failure (planted
-    # symlink, immutable parent, full disk) — the wizard must surface
-    # that rather than print "✓" for a file the daemon will create
-    # under a slacker umask.
+    # Pre-create the audit log with 0o600.  On the pinned v0.39 the
+    # daemon does NOT write to this file (no ``log.audit_path`` field in
+    # its config schema) — it's reserved for the v0.40+ upgrade where
+    # per-request records start flowing.  Because the file is
+    # non-load-bearing today, a pre-create failure (immutable parent,
+    # pre-existing foreign-owned file, full disk) is a WARNING, not a
+    # setup abort.
+    audit_log_ok = True
     try:
         ip.ensure_audit_log(audit_log_path)
     except RuntimeError as exc:
-        console.print(f"  [red]✗ {exc}[/red]")
-        return 1
+        audit_log_ok = False
+        console.print(f"  [yellow]⚠ {exc}[/yellow]")
 
     # Allow operator override of the deny list via
     # ``proxy.upstream_deny_cidrs`` — but the default (None) gives a safe
@@ -381,7 +383,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
     mappings_path = ip.write_mappings(mappings)
     console.print(f"  [green]✓[/green] config:   {cfg_path}")
     console.print(f"  [green]✓[/green] mappings: {mappings_path}")
-    console.print(f"  [green]✓[/green] audit log: {audit_log_path}")
+    if audit_log_ok:
+        console.print(
+            f"  [green]✓[/green] audit log: {audit_log_path} "
+            f"[dim](reserved — not written by iron-proxy v0.39; "
+            f"per-request records land in iron-proxy.log)[/dim]"
+        )
 
     # ------------------------------------------------------------------ enable
     proxy_cfg["enabled"] = True
@@ -451,6 +458,32 @@ def cmd_start(args: argparse.Namespace) -> int:
         and bw_cfg is not None
         and bool(bw_cfg.get("enabled"))
     )
+    # Silent-degrade guard: the operator explicitly chose
+    # ``credential_source: bitwarden``, but secrets.bitwarden has since
+    # been disabled or removed.  Proceeding would quietly start on host
+    # env — exactly the bug class the BW mode is meant to defeat.  Refuse
+    # unless the documented escape hatch is set.
+    if credential_source == "bitwarden" and not refresh_bw:
+        if bool(proxy_cfg.get("allow_env_fallback", False)):
+            console.print(
+                "[yellow]⚠ credential_source=bitwarden but "
+                "secrets.bitwarden is disabled or missing — falling back "
+                "to host-env secrets (allow_env_fallback=true).  Rotated "
+                "Bitwarden keys will NOT propagate.[/yellow]"
+            )
+        else:
+            console.print(
+                "[red]✗ Refusing to start: proxy.credential_source is "
+                "'bitwarden' but secrets.bitwarden is disabled or "
+                "missing.[/red]"
+            )
+            console.print(
+                "  Re-enable it (`secrets.bitwarden.enabled: true`), switch "
+                "back to env credentials with `hermes egress setup "
+                "--no-bitwarden`, or set `proxy.allow_env_fallback: true` "
+                "to opt into the host-env fallback."
+            )
+            return 1
     # Pass the proxy-side allow_env_fallback opt-in through to
     # start_proxy.  This is a deliberate, documented escape hatch: when
     # set, the daemon silently falls back to host env if BWS is
