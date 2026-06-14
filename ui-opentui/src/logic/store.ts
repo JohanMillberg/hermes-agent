@@ -24,7 +24,7 @@ import {
 import type { DetailsMode } from './details.ts'
 import { diffStats, type DiffStats } from './diff.ts'
 import type { SessionTabId } from './sessionPicker.ts'
-import { envFlag, envOutputUnlimited } from './env.ts'
+import { envFlag, envOutputUnlimited, toolOutputsEnabled } from './env.ts'
 import { registerNotifier } from './notify.ts'
 import {
   isChromeNotice,
@@ -997,40 +997,54 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // convention (the only failure signal the live gateway actually ships).
         const error = readStr(event.payload, 'error')
         const summary = readStr(event.payload, 'summary')
+        // Tool-output retention flag (W3, glitch 2026-06-14): when OFF, the rich
+        // result body + raw result/args dicts are neither built nor stored (Ink
+        // parity — Ink keeps only a context line). KEEP either way: name, state,
+        // duration, error, summary, argsPreview, and the file-edit diff (a diff
+        // is a high-value surface, not generic "output"). This is the biggest
+        // memory lever (the OpenTUI-vs-Ink retention asymmetry).
+        const keepOutputs = toolOutputsEnabled()
         // `result_text` is verbose-gated, but the raw `result` is ALWAYS sent —
         // when the verbose text is absent, derive the display body from `result`
         // (so e.g. bash output still renders in non-verbose sessions). Then peel
         // the gateway's "[showing verbose tail; omitted …]" label (item 2) before
         // envelope-stripping, so the body is clean and the note renders tidily.
-        let { body: rawBody, omittedNote } = stripOmittedNote(
-          readStr(event.payload, 'result_text') ?? stringifyResult(event.payload['result']) ?? summary ?? ''
-        )
-        // The view cap is UNLIMITED (HERMES_TUI_TOOL_OUTPUT_LINES unset/0 — the
-        // default), but a gateway-capped `result_text` (omittedNote) is only a
-        // TAIL — substituting the always-full raw `result` is the only way the
-        // uncapped view can actually show everything. Same display pipeline
-        // (envelope strip) — and the same raw-result redaction tradeoff — as the
-        // existing non-verbose stringifyResult fallback above. The omitted note
-        // no longer applies to the full body. With an explicit FINITE cap the
-        // gateway tail + note are kept (the user asked for a bounded view; the
-        // view-side "+N more lines" stays honest below that). File-edit JSON
-        // results stay parseable, so fileTool's diffOutputPlan still suppresses
-        // the diff echo. The redacted-argsText precedence is untouched.
-        if (omittedNote && envOutputUnlimited(process.env.HERMES_TUI_TOOL_OUTPUT_LINES)) {
-          const full = stringifyResult(event.payload['result'])
-          if (full !== undefined) {
-            rawBody = full
-            omittedNote = undefined
+        // Skip the whole body-build when outputs are OFF (nothing consumes it).
+        let resultText = ''
+        let lineCount = 0
+        let omittedNote: string | undefined
+        if (keepOutputs) {
+          let rawBody: string
+          ;({ body: rawBody, omittedNote } = stripOmittedNote(
+            readStr(event.payload, 'result_text') ?? stringifyResult(event.payload['result']) ?? summary ?? ''
+          ))
+          // The view cap is UNLIMITED (HERMES_TUI_TOOL_OUTPUT_LINES unset/0 — the
+          // default), but a gateway-capped `result_text` (omittedNote) is only a
+          // TAIL — substituting the always-full raw `result` is the only way the
+          // uncapped view can actually show everything. Same display pipeline
+          // (envelope strip) — and the same raw-result redaction tradeoff — as the
+          // existing non-verbose stringifyResult fallback above. The omitted note
+          // no longer applies to the full body. With an explicit FINITE cap the
+          // gateway tail + note are kept (the user asked for a bounded view; the
+          // view-side "+N more lines" stays honest below that). File-edit JSON
+          // results stay parseable, so fileTool's diffOutputPlan still suppresses
+          // the diff echo. The redacted-argsText precedence is untouched.
+          if (omittedNote && envOutputUnlimited(process.env.HERMES_TUI_TOOL_OUTPUT_LINES)) {
+            const full = stringifyResult(event.payload['result'])
+            if (full !== undefined) {
+              rawBody = full
+              omittedNote = undefined
+            }
           }
+          resultText = stripToolEnvelope(rawBody)
+          lineCount = resultText ? resultText.replace(/\s+$/, '').split('\n').length : 0
         }
-        const resultText = stripToolEnvelope(rawBody)
-        const lineCount = resultText ? resultText.replace(/\s+$/, '').split('\n').length : 0
         // `args` (full dict) is always sent; stringify as the expanded-view args
         // when verbose `args_text` wasn't captured on start. `duration_s` → header.
         const argsObj = event.payload['args']
         const duration = readOptNum(event.payload, 'duration_s')
         // FULL raw unified diff (file-edit tools; gateway caps at 512KB). Stats
-        // are computed once here, not per render.
+        // are computed once here, not per render. Kept even when outputs are OFF.
         const diffUnified = readStr(event.payload, 'diff_unified')
         setState(
           produce(draft => {
@@ -1041,31 +1055,35 @@ export function createSessionStore(options?: SessionStoreOptions) {
               ;(ensureAssistant(draft).parts ??= []).push(part)
             }
             part.state = 'complete'
-            part.lineCount = lineCount
             if (name) part.name = name
-            if (resultText) part.resultText = resultText
             if (summary) part.summary = summary
             if (error) part.error = error
             if (duration !== undefined) part.duration = duration
-            if (omittedNote) part.omittedNote = omittedNote
             if (diffUnified) {
               part.diffUnified = diffUnified
               part.diffStats = diffStats(diffUnified)
             }
-            // structured dict results feed the per-tool renderers (read_file
-            // content, search matches, clarify Q&A, skill_view description).
-            const resultObj = event.payload['result']
-            if (resultObj && typeof resultObj === 'object' && !Array.isArray(resultObj))
-              part.result = resultObj as Record<string, unknown>
-            // argsPreview (from tool.start `context`) is intentionally NOT overwritten.
-            if (argsObj && typeof argsObj === 'object') {
-              // structured args feed the per-tool renderers (labeled fields, bash command).
-              if (!Array.isArray(argsObj)) part.args = argsObj as Record<string, unknown>
-              if (!part.argsText) {
-                try {
-                  part.argsText = JSON.stringify(argsObj, null, 2)
-                } catch {
-                  /* unstringifiable args — leave unset */
+            // Tool-output bodies (W3): only retained when outputs are ON. With no
+            // resultText/result, defaultRenderer.expandable() is false → header-
+            // only row (Ink parity). argsPreview (from tool.start) is untouched.
+            if (keepOutputs) {
+              part.lineCount = lineCount
+              if (resultText) part.resultText = resultText
+              if (omittedNote) part.omittedNote = omittedNote
+              // structured dict results feed the per-tool renderers (read_file
+              // content, search matches, clarify Q&A, skill_view description).
+              const resultObj = event.payload['result']
+              if (resultObj && typeof resultObj === 'object' && !Array.isArray(resultObj))
+                part.result = resultObj as Record<string, unknown>
+              if (argsObj && typeof argsObj === 'object') {
+                // structured args feed the per-tool renderers (labeled fields, bash command).
+                if (!Array.isArray(argsObj)) part.args = argsObj as Record<string, unknown>
+                if (!part.argsText) {
+                  try {
+                    part.argsText = JSON.stringify(argsObj, null, 2)
+                  } catch {
+                    /* unstringifiable args — leave unset */
+                  }
                 }
               }
             }

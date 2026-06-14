@@ -31,6 +31,22 @@ export function diagnosticsEnabled(): boolean {
 }
 
 /**
+ * Whether rich tool-call OUTPUTS are kept — `HERMES_TUI_TOOL_OUTPUTS` (default
+ * ON). OpenTUI's rich tool cards (full result body + raw result/args dicts) are
+ * its differentiator vs Ink, so they stay on for real users. Setting `=off`
+ * drops both the RENDER and the STORE of those bodies (exact Ink parity: Ink
+ * keeps only a short context line and discards the result/args dicts), which is
+ * the biggest memory lever — used by the bench (D8: a fair Ink-vs-OpenTUI
+ * engine-overhead comparison) and the low-mem mode. The redaction-safe
+ * `argsPreview` one-liner, name/duration/error, and file-edit diffs are KEPT
+ * either way (a diff is a high-value surface, not generic "output"). Read per
+ * call so a wrapper that mutates env before launch sees the live value.
+ */
+export function toolOutputsEnabled(): boolean {
+  return envFlag(process.env.HERMES_TUI_TOOL_OUTPUTS, true)
+}
+
+/**
  * Parse `HERMES_TUI_TOOL_OUTPUT_LINES` (a TUI-only env var — deliberately NOT
  * a config.yaml knob): how many output lines an expanded tool body shows.
  * UNSET → Infinity (UNLIMITED — expanded tool output is uncapped by default;

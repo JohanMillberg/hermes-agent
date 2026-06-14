@@ -381,6 +381,68 @@ describe('file tool renderer — relative path + diff stats (Epic 2.3)', () => {
   })
 })
 
+describe('store: HERMES_TUI_TOOL_OUTPUTS flag (W3 — retention asymmetry lever)', () => {
+  const DIFF = ['--- a/x.py', '+++ b/x.py', '@@ -1,1 +1,1 @@', '-old', '+new'].join('\n')
+  const findTool = (store: Store, id: string) => {
+    const last = store.state.messages[store.state.messages.length - 1]
+    return last?.parts?.find((p): p is ToolPartState => p.type === 'tool' && p.id === id)
+  }
+  const complete = {
+    tool_id: 't1',
+    name: 'terminal',
+    args: { command: 'ls -la' },
+    result_text: 'file-a\nfile-b\nfile-c',
+    duration_s: 0.4,
+    diff_unified: DIFF
+  }
+
+  test('default (ON): rich outputs are retained', () => {
+    const prev = process.env.HERMES_TUI_TOOL_OUTPUTS
+    delete process.env.HERMES_TUI_TOOL_OUTPUTS
+    try {
+      const store = createSessionStore()
+      seedTool(store, { tool_id: 't1', name: 'terminal', context: 'ls -la' }, complete)
+      const part = findTool(store, 't1')
+      expect(part?.resultText).toBe('file-a\nfile-b\nfile-c')
+      expect(part?.lineCount).toBe(3)
+      expect(part?.args).toEqual({ command: 'ls -la' })
+      expect(part?.argsText).toContain('command')
+    } finally {
+      if (prev === undefined) delete process.env.HERMES_TUI_TOOL_OUTPUTS
+      else process.env.HERMES_TUI_TOOL_OUTPUTS = prev
+    }
+  })
+
+  test('OFF: result body + raw result/args are dropped; name/duration/error/diff are kept', () => {
+    const prev = process.env.HERMES_TUI_TOOL_OUTPUTS
+    process.env.HERMES_TUI_TOOL_OUTPUTS = 'off'
+    try {
+      const store = createSessionStore()
+      seedTool(store, { tool_id: 't1', name: 'terminal', context: 'ls -la' }, { ...complete, error: 'boom' })
+      const part = findTool(store, 't1')
+      // suppressed (the memory lever)
+      expect(part?.resultText).toBeUndefined()
+      expect(part?.result).toBeUndefined()
+      expect(part?.args).toBeUndefined()
+      expect(part?.argsText).toBeUndefined()
+      expect(part?.lineCount).toBeUndefined()
+      expect(part?.omittedNote).toBeUndefined()
+      // kept either way
+      expect(part?.name).toBe('terminal')
+      expect(part?.state).toBe('complete')
+      expect(part?.duration).toBe(0.4)
+      expect(part?.error).toBe('boom')
+      expect(part?.argsPreview).toBe('ls -la') // from tool.start context — the Ink-parity one-liner
+      // the file-edit diff is a high-value surface, not generic output — KEPT
+      expect(part?.diffUnified).toBe(DIFF)
+      expect(part?.diffStats).toEqual({ added: 1, removed: 1 })
+    } finally {
+      if (prev === undefined) delete process.env.HERMES_TUI_TOOL_OUTPUTS
+      else process.env.HERMES_TUI_TOOL_OUTPUTS = prev
+    }
+  })
+})
+
 describe('file tool — output suppression under a rendered diff (no raw JSON, ever)', () => {
   // A file-edit result is a JSON record whose payload IS the diff. In a verbose
   // session the gateway REDACTS + CAPS result_text, so it can arrive truncated
