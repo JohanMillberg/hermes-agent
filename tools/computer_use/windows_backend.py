@@ -245,14 +245,23 @@ def _wait_for_user_idle() -> None:
 
     Synthetic input lands in whatever has focus; colliding with a human
     mid-keystroke sprays input across both parties' targets. Wait for
-    HERMES_COMPUTER_USE_IDLE_WAIT seconds (default 1.5, 0 disables) of user
-    idle, but never longer than ~8s total — the agent should yield, not
+    ``computer_use.idle_wait_seconds`` seconds (default 1.5, 0 disables) of
+    user idle, but never longer than ~8s total — the agent should yield, not
     deadlock behind a user who is working.
     """
     try:
-        threshold = float(os.environ.get("HERMES_COMPUTER_USE_IDLE_WAIT", "1.5"))
-    except ValueError:
+        from tools.computer_use.tool import _computer_use_config
+        threshold = float(_computer_use_config().get("idle_wait_seconds", 1.5))
+    except (TypeError, ValueError):
         threshold = 1.5
+    except Exception:
+        threshold = 1.5
+    env_threshold = os.environ.get("HERMES_COMPUTER_USE_IDLE_WAIT")
+    if env_threshold is not None:
+        try:
+            threshold = float(env_threshold)
+        except ValueError:
+            pass
     if threshold <= 0:
         return
     deadline = time.monotonic() + 8.0
@@ -374,14 +383,28 @@ class _OverlayClient:
 
     Strictly fire-and-forget: every failure disables the overlay silently;
     desktop-control actions must never be affected by overlay problems.
-    Disable entirely with HERMES_COMPUTER_USE_OVERLAY=0.
+    Disable with ``computer_use.overlay: false``. ``HERMES_COMPUTER_USE_OVERLAY``
+    remains as a test/escape hatch.
     """
 
     def __init__(self) -> None:
         self._proc = None
         self._sock: Optional[socket.socket] = None
         self._addr: Optional[Tuple[str, int]] = None
-        self._dead = os.environ.get("HERMES_COMPUTER_USE_OVERLAY", "1") == "0"
+        overlay_enabled = True
+        try:
+            from tools.computer_use.tool import _computer_use_config
+            raw_overlay = _computer_use_config().get("overlay", True)
+            if isinstance(raw_overlay, str):
+                overlay_enabled = raw_overlay.strip().lower() not in {"0", "false", "no", "off"}
+            else:
+                overlay_enabled = bool(raw_overlay)
+        except Exception:
+            overlay_enabled = True
+        env_overlay = os.environ.get("HERMES_COMPUTER_USE_OVERLAY")
+        if env_overlay is not None:
+            overlay_enabled = env_overlay.strip().lower() not in {"0", "false", "no", "off"}
+        self._dead = not overlay_enabled
 
     @property
     def pid(self) -> Optional[int]:

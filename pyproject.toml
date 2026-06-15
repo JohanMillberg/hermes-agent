@@ -109,7 +109,9 @@ dependencies = [
   # (tools/computer_use/windows_backend.py). Pure-python over comtypes;
   # win32-only. The backend degrades to unavailable if the import fails,
   # so this never affects non-Windows installs.
-  "uiautomation>=2.0.29,<3; sys_platform == 'win32'",
+  "uiautomation==2.0.29; sys_platform == 'win32'",
+  # Win32 window enumeration / foreground management for Windows computer_use.
+  "pywin32==311; sys_platform == 'win32'",
   # Image resize recovery for the vision tools. Pillow shrinks oversized images
   # (>5 MB or >8000px) at embed time; without it the byte AND pixel-dimension
   # shrink paths no-op, so an oversized image bakes into immutable history and

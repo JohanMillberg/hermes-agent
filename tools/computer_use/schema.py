@@ -86,9 +86,10 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "description": (
                     "Optional. Limit capture/action to a specific app "
-                    "(by name, e.g. 'Safari', or bundle ID, "
+                    "(by name, e.g. 'Safari' or 'Notepad', executable "
+                    "name on Windows, or bundle ID on macOS such as "
                     "'com.apple.Safari'). If omitted, operates on the "
-                    "frontmost app's window or the whole screen."
+                    "frontmost app/window."
                 ),
             },
             "max_elements": {
@@ -142,7 +143,10 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "type": "array",
                 "items": {
                     "type": "string",
-                    "enum": ["cmd", "shift", "option", "alt", "ctrl", "fn"],
+                    "enum": [
+                        "cmd", "shift", "option", "alt", "ctrl", "fn",
+                        "win", "windows", "super", "meta",
+                    ],
                 },
                 "description": "Modifier keys held during the action.",
             },
@@ -167,7 +171,11 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "direction": {
                 "type": "string",
                 "enum": ["up", "down", "left", "right"],
-                "description": "Scroll direction.",
+                "description": (
+                    "Scroll direction for action='scroll'. For "
+                    "action='switch_desktop', use 'left' or 'right' to move "
+                    "to the adjacent Windows virtual desktop."
+                ),
             },
             "amount": {
                 "type": "integer",
@@ -205,18 +213,9 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "description": (
                     "Only for action='focus_app'. If true, brings the "
                     "window to front (DISRUPTS the user). Default false "
-                    "— input is routed to the app without raising, "
-                    "matching the background co-work model."
-                ),
-            },
-            # ── switch_desktop ──────────────────────────────────────
-            "direction": {
-                "type": "string",
-                "enum": ["left", "right"],
-                "description": (
-                    "Only for action='switch_desktop'. Switches to the "
-                    "adjacent virtual desktop. Requires Windows 10+ with "
-                    "multiple virtual desktops."
+                    "only records the target. macOS can route later input "
+                    "without raising; Windows pointer/keyboard actions still "
+                    "foreground the target when they run."
                 ),
             },
             # ── return shape ───────────────────────────────────────

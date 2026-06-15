@@ -79,7 +79,7 @@ CONFIGURABLE_TOOLSETS = [
     ("discord",         "💬 Discord (read/participate)", "fetch messages, search members, create thread"),
     ("discord_admin",   "🛡️  Discord Server Admin",    "list channels/roles, pin, assign roles"),
     ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries, DM"),
-    ("computer_use",     "🖱️  Computer Use (macOS)",     "background desktop control via cua-driver"),
+    ("computer_use",     "🖱️  Computer Use",             "desktop control via cua-driver or Windows UIA"),
 ]
 
 
@@ -517,9 +517,8 @@ TOOL_CATEGORIES = {
         ],
     },
     "computer_use": {
-        "name": "Computer Use (macOS)",
+        "name": "Computer Use",
         "icon": "🖱️",
-        "platform_gate": "darwin",
         "providers": [
             {
                 "name": "cua-driver (background)",
@@ -534,6 +533,15 @@ TOOL_CATEGORIES = {
                     # optional pin for reproducibility across macOS updates.
                 ],
                 "post_setup": "cua_driver",
+            },
+            {
+                "name": "Windows UIA + SendInput",
+                "badge": "free · local · Windows",
+                "tag": (
+                    "Native Windows UI Automation element tree plus SendInput. "
+                    "Actions briefly foreground the target window."
+                ),
+                "env_vars": [],
             },
         ],
     },

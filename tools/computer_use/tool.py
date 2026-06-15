@@ -77,6 +77,7 @@ _SAFE_ACTIONS = frozenset({"capture", "wait", "list_apps"})
 _DESTRUCTIVE_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
     "drag", "scroll", "type", "key", "set_value", "focus_app",
+    "switch_desktop",
 })
 
 # Hard-blocked key combinations. Mirrored from #4562 — these are destructive
@@ -143,23 +144,46 @@ def _default_backend_name() -> str:
     return "windows" if sys.platform == "win32" else "cua"
 
 
+def _computer_use_config() -> Dict[str, Any]:
+    """Return the non-secret computer_use config block from config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        section = cfg.get("computer_use")
+        return section if isinstance(section, dict) else {}
+    except Exception:
+        return {}
+
+
+def _configured_backend_name() -> str:
+    """Return the requested backend, honoring env only as a test/escape hatch."""
+    env_backend = os.environ.get("HERMES_COMPUTER_USE_BACKEND")
+    if env_backend is not None:
+        return env_backend.strip().lower() or "auto"
+    cfg_backend = str(_computer_use_config().get("backend") or "auto").strip().lower()
+    return cfg_backend or "auto"
+
+
 def _get_backend() -> ComputerUseBackend:
     global _backend
     with _backend_lock:
         if _backend is None:
-            backend_name = os.environ.get("HERMES_COMPUTER_USE_BACKEND", "").lower()
-            if not backend_name:
+            backend_name = _configured_backend_name()
+            if backend_name == "auto":
                 backend_name = _default_backend_name()
             if backend_name in {"cua", "cua-driver"}:
                 from tools.computer_use.cua_backend import CuaDriverBackend
                 _backend = CuaDriverBackend()
-            elif backend_name == "windows":
+            elif backend_name in {"windows", "win", "uia", "windows-uia"}:
                 from tools.computer_use.windows_backend import WindowsUIABackend
                 _backend = WindowsUIABackend()
             elif backend_name == "noop":  # pragma: no cover
                 _backend = _NoopBackend()
             else:
-                raise RuntimeError(f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}")
+                raise RuntimeError(
+                    "Unknown computer_use backend "
+                    f"{backend_name!r}; use auto, cua, windows, or noop"
+                )
             _backend.start()
         return _backend
 
@@ -273,7 +297,10 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     except Exception as e:
         return json.dumps({
             "error": f"computer_use backend unavailable: {e}",
-            "hint": "Run `hermes tools` and enable Computer Use to install cua-driver.",
+            "hint": (
+                "Run `hermes tools` and enable Computer Use. macOS requires "
+                "cua-driver; Windows requires pywin32, uiautomation, and Pillow."
+            ),
         })
 
     try:
@@ -332,6 +359,8 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
         return f"key {args.get('keys', '')!r}"
     if action == "focus_app":
         return f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")
+    if action == "switch_desktop":
+        return f"switch desktop {args.get('direction', '')!r}"
     return action
 
 
@@ -428,8 +457,6 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
 
     if action == "switch_desktop":
         direction = args.get("direction", "")
-        if not hasattr(backend, "switch_desktop"):
-            return json.dumps({"error": "switch_desktop not supported by current backend"})
         res = backend.switch_desktop(str(direction))
         return _maybe_follow_capture(backend, res, capture_after)
 
@@ -797,7 +824,7 @@ def _route_capture_through_aux_vision(
     except Exception as exc:
         logger.warning(
             "computer_use: auxiliary.vision pre-analysis failed (%s); "
-            "falling back to native multimodal envelope",
+            "returning to caller without aux analysis",
             exc,
         )
         return None
@@ -899,18 +926,23 @@ def _element_to_dict(e: UIElement) -> Dict[str, Any]:
 def check_computer_use_requirements() -> bool:
     """Return True iff computer_use can run on this host.
 
-    macOS: cua-driver binary installed (or override via env).
-    Windows: uiautomation + Pillow importable (see windows_backend).
+    macOS: cua-driver binary installed. Windows: UIA backend dependencies
+    import cleanly. Other platforms stay hidden.
     """
-    if sys.platform == "darwin":
+    backend_name = _configured_backend_name()
+    if backend_name == "auto":
+        backend_name = _default_backend_name()
+    if sys.platform == "darwin" and backend_name in {"cua", "cua-driver"}:
         from tools.computer_use.cua_backend import cua_driver_binary_available
         return cua_driver_binary_available()
-    if sys.platform == "win32":
+    if sys.platform == "win32" and backend_name in {"windows", "win", "uia", "windows-uia"}:
         try:
             from tools.computer_use.windows_backend import windows_backend_available
             return windows_backend_available()
         except Exception:
             return False
+    if backend_name == "noop":
+        return True
     return False
 
 

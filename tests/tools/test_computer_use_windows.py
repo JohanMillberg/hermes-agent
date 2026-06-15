@@ -155,6 +155,11 @@ class TestWiring:
         assert isinstance(backend, _FakeWindowsBackend)
         assert backend.started
 
+    def test_empty_env_uses_auto_backend(self):
+        from tools.computer_use.tool import _configured_backend_name
+        with patch.dict(os.environ, {"HERMES_COMPUTER_USE_BACKEND": ""}):
+            assert _configured_backend_name() == "auto"
+
     def test_default_backend_is_windows_on_win32(self, monkeypatch):
         from tools.computer_use.tool import _default_backend_name
         monkeypatch.setattr(sys, "platform", "win32")
@@ -205,6 +210,20 @@ class TestWindowsBlockedCombos:
             result = handle_computer_use({"action": "key", "keys": "ctrl+s"})
         payload = json.loads(result)
         assert payload.get("ok") is True
+
+
+class TestSwitchDesktopWiring:
+    def test_switch_desktop_requires_approval(self):
+        from tools.computer_use.tool import _DESTRUCTIVE_ACTIONS
+        assert "switch_desktop" in _DESTRUCTIVE_ACTIONS
+
+    def test_schema_keeps_scroll_directions_and_switch_desktop(self):
+        from tools.computer_use.schema import COMPUTER_USE_SCHEMA
+        props = COMPUTER_USE_SCHEMA["parameters"]["properties"]
+        assert set(props["direction"]["enum"]) == {"up", "down", "left", "right"}
+        actions = set(props["action"]["enum"])
+        assert "scroll" in actions
+        assert "switch_desktop" in actions
 
 
 # ---------------------------------------------------------------------------

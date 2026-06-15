@@ -3,21 +3,21 @@ title: Computer Use
 sidebar_position: 16
 ---
 
-# Computer Use (macOS)
+# Computer Use
 
-Hermes Agent can drive your Mac's desktop — clicking, typing, scrolling,
-dragging — in the **background**. Your cursor doesn't move, keyboard focus
-doesn't change, and macOS doesn't switch Spaces on you. You and the agent
-co-work on the same machine.
-
+Hermes Agent can drive your desktop — clicking, typing, scrolling, and
+dragging — through one model-agnostic `computer_use` tool. On macOS it uses
+cua-driver for background control. On Windows it uses UI Automation for the
+element tree and SendInput for mouse/keyboard actions.
 Unlike most computer-use integrations, this works with **any tool-capable
 model** — Claude, GPT, Gemini, or an open model on a local vLLM endpoint.
 There's no Anthropic-native schema to worry about.
 
 ## How it works
 
-The `computer_use` toolset speaks MCP over stdio to [`cua-driver`](https://github.com/trycua/cua),
-a macOS driver that uses SkyLight private SPIs (`SLEventPostToPid`,
+On macOS, the `computer_use` toolset speaks MCP over stdio to
+[`cua-driver`](https://github.com/trycua/cua), a driver that uses SkyLight
+private SPIs (`SLEventPostToPid`,
 `SLPSPostEventRecordTo`) and the `_AXObserverAddNotificationAndCheckRemote`
 accessibility SPI to:
 
@@ -30,9 +30,20 @@ accessibility SPI to:
 That combination is what OpenAI's Codex "background computer-use" ships.
 cua-driver is the open-source equivalent.
 
+On Windows, Hermes uses the `uiautomation` package to enumerate controls and
+set native values, Pillow for screenshots, and pywin32/SendInput for window
+focus and mouse/keyboard injection. Windows cannot post input to background
+windows, so pointer and keyboard actions briefly foreground the target window.
+`set_value` is the exception: when the target control exposes the right UIA
+pattern, Hermes can set it without moving focus.
+
 ## Enabling
 
-Pick whichever path is most convenient — both run the same upstream installer:
+On Windows, install Hermes normally and enable `Computer Use` from
+`hermes tools`; the Python dependencies are included in the Windows install.
+
+On macOS, pick whichever path is most convenient — both run the same upstream
+installer:
 
 **Option 1: dedicated CLI command (most direct).**
 
@@ -46,7 +57,7 @@ Use `hermes computer-use status` to verify the install.
 
 **Option 2: enable the toolset interactively.**
 
-1. Run `hermes tools`, pick `🖱️ Computer Use (macOS)` → `cua-driver (background)`.
+1. Run `hermes tools`, pick `🖱️ Computer Use` → `cua-driver (background)`.
 2. The setup runs the upstream installer (same as Option 1).
 
 After installing, regardless of which path you took:
@@ -95,8 +106,9 @@ The agent's plan:
    and get the new screenshot.
 5. Click the top result, read the body, summarise.
 
-During all of this, your cursor stays wherever you left it and Mail never
-comes to front.
+On macOS, your cursor stays wherever you left it and Mail never comes to
+front. On Windows, the target window is foregrounded while pointer/keyboard
+actions run; prefer `set_value` for form fields and dropdowns when possible.
 
 ## Provider compatibility
 
@@ -149,12 +161,15 @@ of screenshot context, not ~600K.
 
 ## Limitations
 
-- **macOS only.** cua-driver uses private Apple SPIs that don't exist on
-  Linux or Windows. For cross-platform GUI automation, use the `browser`
-  toolset.
+- **Platform scope.** Desktop computer-use currently supports macOS via
+  cua-driver and Windows via UI Automation. Linux desktop automation is not
+  enabled yet. For cross-platform web tasks, prefer the `browser` toolset.
 - **Private SPI risk.** Apple can change SkyLight's symbol surface in any
   OS update. Pin the driver version with the `HERMES_CUA_DRIVER_VERSION`
   env var if you want reproducibility across a macOS bump.
+- **Windows foregrounding.** Windows pointer/keyboard actions move the real
+  cursor and foreground the target window. Hermes waits briefly for user idle
+  before injecting input, but you should still avoid fighting an active user.
 - **Performance.** Background mode is slower than foreground —
   SkyLight-routed events take ~5-20ms vs direct HID posting. Not
   noticeable for agent-speed clicking; noticeable if you try to record a
@@ -177,11 +192,24 @@ Swap the backend entirely (for testing):
 HERMES_COMPUTER_USE_BACKEND=noop   # records calls, no side effects
 ```
 
+Non-secret runtime settings live in `config.yaml`:
+
+```yaml
+computer_use:
+  backend: auto          # auto | cua | windows | noop
+  idle_wait_seconds: 1.5 # Windows user-idle guard; 0 disables
+  overlay: true          # Windows visible element/click overlay
+```
+
 ## Troubleshooting
 
 **`computer_use backend unavailable: cua-driver is not installed`** — Run
 `hermes computer-use install` to fetch the cua-driver binary, or run
 `hermes tools` and enable the Computer Use toolset.
+
+**`computer_use backend unavailable` on Windows** — Re-run the current Hermes
+installer/update so the Windows-only dependencies (`pywin32`, `uiautomation`,
+Pillow) are present, then enable Computer Use in `hermes tools`.
 
 **Clicks seem to have no effect** — Capture and verify. A modal you
 didn't see may be blocking input. Dismiss it with `escape` or the close

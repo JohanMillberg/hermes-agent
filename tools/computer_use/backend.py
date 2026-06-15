@@ -150,6 +150,14 @@ class ComputerUseBackend(ABC):
         `element` is the 1-based SOM index returned by a prior capture call.
         """
 
+    def switch_desktop(self, direction: str) -> ActionResult:
+        """Switch to an adjacent virtual desktop when the backend supports it."""
+        return ActionResult(
+            ok=False,
+            action="switch_desktop",
+            message="switch_desktop is not supported by this backend",
+        )
+
     # ── Timing ──────────────────────────────────────────────────────
     def wait(self, seconds: float) -> ActionResult:
         """Default implementation: time.sleep."""

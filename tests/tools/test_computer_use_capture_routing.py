@@ -1,4 +1,4 @@
-﻿"""End-to-end regression for #24015 -- capture routing via auxiliary.vision.
+"""End-to-end regression for #24015 -- capture routing via auxiliary.vision.
 
 When ``computer_use(action='capture', mode='som'|'vision')`` returns a
 screenshot, ``_capture_response`` previously always returned a
@@ -15,7 +15,7 @@ deterministic stubs for:
 * ``vision_analyze_tool`` (the aux LLM call)
 * ``hermes_constants.get_hermes_dir`` (cache path)
 
-â€¦so the full code path is covered without a live cua-driver, a real
+...so the full code path is covered without a live cua-driver, a real
 auxiliary client, or network access.
 """
 
@@ -33,13 +33,13 @@ import pytest
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
 
-# 8Ã—8 PNG (transparent) -- minimal provider-acceptable bytes that decode cleanly.
+# 8x8 PNG (transparent) -- minimal provider-acceptable bytes that decode cleanly.
 _PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAADUlEQVR4nG"
     "NgGAUgAAABCAABgukLHQAAAABJRU5ErkJggg=="
 )
 
-# 1Ã—1 JPEG -- used to verify mime detection works for either stream type.
+# 1x1 JPEG -- used to verify mime detection works for either stream type.
 _JPEG_B64 = (
     "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEB"
     "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/"
@@ -65,7 +65,7 @@ def _make_capture(
     mode: str = "som",
     elements=None,
     app: str = "Safari",
-    window_title: str = "GitHub â€“ Issue #24015",
+    window_title: str = "GitHub - Issue #24015",
     width: int = 1280,
     height: int = 800,
 ):
@@ -195,7 +195,7 @@ class TestCaptureResponseRoutedToAuxVision:
         # The original AX-only metadata (window title, element index, app)
         # is preserved alongside the new vision analysis so the agent loses
         # no context vs the multimodal path.
-        assert body["window_title"] == "GitHub â€“ Issue #24015"
+        assert body["window_title"] == "GitHub - Issue #24015"
         assert len(body["elements"]) == 2
 
         assert captured_calls.get("called") is True

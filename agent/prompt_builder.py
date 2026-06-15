@@ -463,6 +463,8 @@ _WINDOWS_COMPUTER_USE_GUIDANCE = (
     "`action='key', keys='ctrl+s'` — note `cmd` is accepted and maps to "
     "Ctrl; use `win` for the Windows key. For scrolling "
     "`action='scroll', direction='down', amount=3`.\n"
+    "Use `action='switch_desktop', direction='left'|'right'` only when the "
+    "task explicitly needs another Windows virtual desktop.\n"
     "4. Use `action='set_value'` with an `element` to set a text field, "
     "dropdown, or slider directly through UI Automation — this is the ONE "
     "action that works WITHOUT foregrounding the window, so prefer it for "

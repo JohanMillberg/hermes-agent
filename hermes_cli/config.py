@@ -811,6 +811,17 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    "computer_use": {
+        # auto = cua-driver on macOS, Windows UIA on Windows. Explicit values:
+        # "cua" / "windows" / "noop" (tests only).
+        "backend": "auto",
+        # Windows UIA backend: wait this long for the user to stop typing or
+        # moving the mouse before injecting input. 0 disables the guard.
+        "idle_wait_seconds": 1.5,
+        # Windows UIA backend: visible click/element overlay for shared desktop
+        # awareness. Best-effort; automation still works if it cannot start.
+        "overlay": True,
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
