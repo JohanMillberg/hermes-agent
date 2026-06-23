@@ -1,0 +1,41 @@
+name: Build Hermes Agent Image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: self-hosted
+    env:
+      DOCKER_HOST: tcp://localhost:2375
+      IMAGE_REPO: forgejo.lan/kvarnberg/hermes-agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Docker CLI
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends docker.io ca-certificates git
+
+      - name: Wait for Docker
+        run: |
+          until docker info >/dev/null 2>&1; do
+            sleep 2
+          done
+
+      - name: Build and push
+        run: |
+          set -eu
+          tag="main-$(git rev-parse --short=9 HEAD)"
+          image="${IMAGE_REPO}:${tag}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login forgejo.lan -u "${{ github.actor }}" --password-stdin
+          docker build \
+            --build-arg "HERMES_GIT_SHA=${GITHUB_SHA}" \
+            -t "${image}" \
+            -f Dockerfile \
+            .
+          docker push "${image}"
+          echo "Pushed ${image}"
