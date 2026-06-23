@@ -29,7 +29,7 @@ jobs:
       - name: Build and push
         run: |
           set -eu
-          tag="main-$(git rev-parse --short=9 HEAD)"
+          tag="main-$(printf '%.9s' "$GITHUB_SHA")"
           image="${IMAGE_REPO}:${tag}"
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login forgejo.lan -u "${{ github.actor }}" --password-stdin
           docker build \
