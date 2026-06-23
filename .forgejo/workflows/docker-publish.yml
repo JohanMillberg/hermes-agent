@@ -35,7 +35,7 @@ jobs:
           set -eu
           tag="main-$(printf '%.9s' "$GITHUB_SHA")"
           image="${IMAGE_REPO}:${tag}"
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login forgejo.lan -u "${{ github.actor }}" --password-stdin
+          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login forgejo.lan -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin
           docker build \
             --build-arg "HERMES_GIT_SHA=${GITHUB_SHA}" \
             -t "${image}" \
