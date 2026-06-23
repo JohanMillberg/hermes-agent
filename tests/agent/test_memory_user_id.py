@@ -8,8 +8,11 @@ import json
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import MemoryManager
+from agent.agent_init import _gateway_memory_scope
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +65,34 @@ class RecordingProvider(MemoryProvider):
 
 class TestMemoryManagerUserIdThreading:
     """Verify user_id reaches providers via initialize_all."""
+
+    def test_discord_memory_scope_includes_guild_and_user(self):
+        assert _gateway_memory_scope(
+            platform="discord",
+            guild_id="111",
+            user_id="42",
+        ) == "discord:111:42"
+        assert _gateway_memory_scope(
+            platform="discord",
+            chat_type="dm",
+            user_id="42",
+        ) == "discord:dm:42"
+
+    def test_discord_memory_scope_uses_chat_fallback_for_missing_guild(self):
+        assert _gateway_memory_scope(
+            platform="discord",
+            chat_id="999",
+            chat_type="thread",
+            user_id="42",
+        ) == "discord:chat:999:42"
+
+    def test_discord_non_dm_memory_scope_requires_tenant_or_chat(self):
+        with pytest.raises(ValueError):
+            _gateway_memory_scope(
+                platform="discord",
+                chat_type="group",
+                user_id="42",
+            )
 
     def test_user_id_forwarded_to_provider(self):
         mgr = MemoryManager()
@@ -148,6 +179,21 @@ class TestMemoryManagerUserIdThreading:
         assert p2._init_kwargs.get("user_id") == "slack_U12345"
         assert p2._init_kwargs.get("platform") == "slack"
 
+    def test_memory_scope_forwarded_to_provider(self):
+        mgr = MemoryManager()
+        p = RecordingProvider()
+        mgr.add_provider(p)
+
+        mgr.initialize_all(
+            session_id="sess-scoped",
+            platform="discord",
+            user_id="42",
+            memory_scope="discord:111:42",
+        )
+
+        assert p._init_kwargs.get("user_id") == "42"
+        assert p._init_kwargs.get("memory_scope") == "discord:111:42"
+
 
 # ---------------------------------------------------------------------------
 # Mem0 provider user_id tests
@@ -222,6 +268,24 @@ class TestMem0UserIdScoping:
         assert p2._user_id == "bob_456"
         assert p1._user_id != p2._user_id
 
+    def test_memory_scope_overrides_gateway_user_id(self):
+        from plugins.memory.mem0 import Mem0MemoryProvider
+
+        provider = Mem0MemoryProvider()
+        with patch("plugins.memory.mem0._load_config", return_value={
+            "api_key": "test-key",
+            "user_id": "hermes-user",
+            "agent_id": "hermes",
+            "rerank": True,
+        }):
+            provider.initialize(
+                session_id="test-sess",
+                user_id="discord_user_789",
+                memory_scope="discord:guild_123:discord_user_789",
+            )
+
+        assert provider._user_id == "discord:guild_123:discord_user_789"
+
 
 # ---------------------------------------------------------------------------
 # Honcho provider user_id tests
@@ -267,11 +331,12 @@ class TestHonchoUserIdScoping:
             provider.initialize(
                 session_id="test-sess",
                 user_id="discord_user_789",
+                memory_scope="discord:guild_123:discord_user_789",
                 platform="discord",
             )
 
         assert mock_cfg.peer_name == "static-user"
-        assert mock_manager_cls.call_args.kwargs["runtime_user_peer_name"] == "discord_user_789"
+        assert mock_manager_cls.call_args.kwargs["runtime_user_peer_name"] == "discord:guild_123:discord_user_789"
 
     def test_session_manager_prefers_runtime_user_id_over_config_peer_name(self):
         """Session manager should isolate gateway users even when config peer_name is static."""
@@ -355,4 +420,3 @@ class TestAIAgentUserIdPropagation:
             agent = object.__new__(AIAgent)
             agent._user_id = None
             assert agent._user_id is None
-

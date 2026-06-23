@@ -156,6 +156,28 @@ class TestResolveChannelPrompts:
 
         assert event.channel_prompt == "Command prompt"
 
+    def test_build_slash_event_passes_guild_id(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {}
+        adapter.build_source = MagicMock(return_value=SimpleNamespace())
+
+        interaction = SimpleNamespace(
+            channel_id=321,
+            guild_id=42,
+            guild=SimpleNamespace(id=42, name="Wetlands"),
+            channel=SimpleNamespace(
+                name="general",
+                guild=SimpleNamespace(id=42, name="Wetlands"),
+                parent_id=None,
+            ),
+            user=SimpleNamespace(id=1, display_name="Brenner"),
+        )
+        adapter._get_effective_topic = MagicMock(return_value=None)
+
+        adapter._build_slash_event(interaction, "/retry")
+
+        assert adapter.build_source.call_args.kwargs["guild_id"] == 42
+
     @pytest.mark.asyncio
     async def test_dispatch_thread_session_inherits_parent_channel_prompt(self):
         adapter = _make_adapter()
@@ -174,6 +196,25 @@ class TestResolveChannelPrompts:
 
         dispatched_event = adapter.handle_message.await_args.args[0]
         assert dispatched_event.channel_prompt == "Parent prompt"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_thread_session_passes_guild_id(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {}
+        adapter.build_source = MagicMock(return_value=SimpleNamespace())
+        adapter._get_effective_topic = MagicMock(return_value=None)
+        adapter.handle_message = AsyncMock()
+
+        interaction = SimpleNamespace(
+            guild_id=42,
+            guild=SimpleNamespace(id=42, name="Wetlands"),
+            channel=SimpleNamespace(id=200, parent=None),
+            user=SimpleNamespace(id=1, display_name="Brenner"),
+        )
+
+        await adapter._dispatch_thread_session(interaction, "999", "new-thread", "hello")
+
+        assert adapter.build_source.call_args.kwargs["guild_id"] == 42
 
     def test_blank_prompts_are_ignored(self):
         adapter = _make_adapter()

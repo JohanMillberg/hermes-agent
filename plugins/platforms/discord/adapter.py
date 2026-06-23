@@ -3468,6 +3468,7 @@ class DiscordAdapter(BasePlatformAdapter):
         is_dm = isinstance(interaction.channel, discord.DMChannel)
         is_thread = isinstance(interaction.channel, discord.Thread)
         thread_id = None
+        guild_id = getattr(interaction, "guild_id", None) or getattr(getattr(interaction, "guild", None), "id", None)
 
         if is_dm:
             chat_type = "dm"
@@ -3495,6 +3496,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            guild_id=guild_id,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -3560,8 +3562,10 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> None:
         """Build a MessageEvent pointing at a thread and send it through handle_message."""
         guild_name = ""
+        guild_id = getattr(interaction, "guild_id", None)
         if hasattr(interaction, "guild") and interaction.guild:
             guild_name = interaction.guild.name
+            guild_id = guild_id or getattr(interaction.guild, "id", None)
 
         chat_name = f"{guild_name} / {thread_name}" if guild_name else thread_name
 
@@ -3577,6 +3581,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            guild_id=guild_id,
         )
 
         _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
@@ -3749,6 +3754,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self,
         channel: Any,
         before: "DiscordMessage",
+        author_id: str | None = None,
     ) -> str:
         """Fetch recent channel messages for conversational context.
 
@@ -3817,6 +3823,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 # For history context, "mentions" is treated as "all" — we are
                 # deciding what context to show, not whether to respond.
                 if getattr(msg.author, "bot", False) and not include_other_bots:
+                    continue
+                if author_id and str(getattr(msg.author, "id", "")) != str(author_id):
                     continue
 
                 content = getattr(msg, "clean_content", msg.content) or ""
@@ -4825,7 +4833,9 @@ class DiscordAdapter(BasePlatformAdapter):
             _has_mention_gap = require_mention and not is_free_channel and not in_bot_thread
             if (_has_mention_gap or is_thread) and auto_threaded_channel is None:
                 _backfill_text = await self._fetch_channel_context(
-                    message.channel, before=message,
+                    message.channel,
+                    before=message,
+                    author_id=str(message.author.id),
                 )
                 if _backfill_text:
                     _channel_context = _backfill_text

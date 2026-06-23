@@ -133,6 +133,28 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _gateway_memory_scope(
+    *,
+    platform: str | None,
+    user_id: str | None,
+    guild_id: str | None = None,
+    chat_id: str | None = None,
+    chat_type: str | None = None,
+    explicit: str | None = None,
+) -> str:
+    if explicit:
+        return explicit
+    if platform != "discord" or not user_id:
+        return ""
+    if guild_id:
+        return f"discord:{guild_id}:{user_id}"
+    if chat_type == "dm":
+        return f"discord:dm:{user_id}"
+    if chat_id:
+        return f"discord:chat:{chat_id}:{user_id}"
+    raise ValueError("Discord non-DM memory scope requires guild_id or chat_id")
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -186,6 +208,8 @@ def init_agent(
     chat_name: str = None,
     chat_type: str = None,
     thread_id: str = None,
+    guild_id: str = None,
+    memory_scope: str = None,
     gateway_session_key: str = None,
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
@@ -269,6 +293,15 @@ def init_agent(
     agent._chat_name = chat_name
     agent._chat_type = chat_type
     agent._thread_id = thread_id
+    agent._guild_id = guild_id
+    agent._memory_scope = _gateway_memory_scope(
+        platform=platform,
+        user_id=user_id,
+        guild_id=guild_id,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        explicit=memory_scope,
+    )
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
@@ -1078,6 +1111,7 @@ def init_agent(
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    memory_scope=agent._memory_scope,
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
@@ -1130,6 +1164,11 @@ def init_agent(
                         _init_kwargs["chat_type"] = agent._chat_type
                     if agent._thread_id:
                         _init_kwargs["thread_id"] = agent._thread_id
+                    if agent._guild_id:
+                        _init_kwargs["guild_id"] = agent._guild_id
+                        _init_kwargs["tenant_id"] = agent._guild_id
+                    if agent._memory_scope:
+                        _init_kwargs["memory_scope"] = agent._memory_scope
                     # Thread gateway session key for stable per-chat Honcho session isolation
                     if agent._gateway_session_key:
                         _init_kwargs["gateway_session_key"] = agent._gateway_session_key

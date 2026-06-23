@@ -26,6 +26,25 @@ class TestMemorySchema:
         assert ">80%" not in description
 
 
+class TestMemoryScope:
+    def test_scoped_memory_uses_separate_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        alice = MemoryStore(memory_scope="discord:111:alice")
+        bob = MemoryStore(memory_scope="discord:111:bob")
+
+        assert alice.add("user", "Alice prefers English")["success"] is True
+        assert bob.add("user", "Bob prefers Swedish")["success"] is True
+
+        alice_reload = MemoryStore(memory_scope="discord:111:alice")
+        bob_reload = MemoryStore(memory_scope="discord:111:bob")
+        alice_reload.load_from_disk()
+        bob_reload.load_from_disk()
+
+        assert alice_reload.user_entries == ["Alice prefers English"]
+        assert bob_reload.user_entries == ["Bob prefers Swedish"]
+
+
 # =========================================================================
 # Security scanning
 # =========================================================================

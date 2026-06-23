@@ -357,7 +357,7 @@ class HonchoMemoryProvider(MemoryProvider):
             honcho=client,
             config=cfg,
             context_tokens=cfg.context_tokens,
-            runtime_user_peer_name=kwargs.get("user_id") or None,
+            runtime_user_peer_name=kwargs.get("memory_scope") or kwargs.get("user_id") or None,
             runtime_user_peer_name_alt=kwargs.get("user_id_alt") or None,
         )
 
@@ -387,7 +387,11 @@ class HonchoMemoryProvider(MemoryProvider):
         try:
             if not session.messages and cfg.session_strategy != "per-session":
                 from hermes_constants import get_hermes_home
-                mem_dir = str(get_hermes_home() / "memories")
+                memory_scope = kwargs.get("memory_scope") or ""
+                mem_dir = get_hermes_home() / "memories"
+                if memory_scope:
+                    mem_dir = mem_dir / str(memory_scope).replace("/", "_")
+                mem_dir = str(mem_dir)
                 self._manager.migrate_memory_files(self._session_key, mem_dir)
                 logger.debug("Honcho memory file migration attempted for new session: %s", self._session_key)
             elif cfg.session_strategy == "per-session":

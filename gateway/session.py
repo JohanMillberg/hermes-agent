@@ -592,6 +592,8 @@ def is_shared_multi_user_session(
     """
     if source.chat_type == "dm":
         return False
+    if source.platform == Platform.DISCORD:
+        return False
     if source.thread_id:
         return not thread_sessions_per_user
     return not group_sessions_per_user
@@ -620,7 +622,9 @@ def build_session_key(
         ``thread_sessions_per_user`` is False (default), threads are *shared* across all
         participants — user_id is NOT appended, so every user in the thread
         shares a single session.  This is the expected UX for threaded
-        conversations (Telegram forum topics, Discord threads, Slack threads).
+        conversations (Telegram forum topics, Slack threads).
+      - Discord is stricter: server/channel/thread sessions always append
+        user_id when available, regardless of the group/thread sharing flags.
       - Without participant identifiers, or when isolation is disabled, messages fall back to one
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
@@ -652,11 +656,11 @@ def build_session_key(
     if source.thread_id:
         key_parts.append(source.thread_id)
 
-    # In threads, default to shared sessions (all participants see the same
+    # In non-Discord threads, default to shared sessions (all participants see the same
     # conversation).  Per-user isolation only applies when explicitly enabled
     # via thread_sessions_per_user, or when there is no thread (regular group).
-    isolate_user = group_sessions_per_user
-    if source.thread_id and not thread_sessions_per_user:
+    isolate_user = True if source.platform == Platform.DISCORD else group_sessions_per_user
+    if source.thread_id and not thread_sessions_per_user and source.platform != Platform.DISCORD:
         isolate_user = False
 
     if isolate_user and participant_id:

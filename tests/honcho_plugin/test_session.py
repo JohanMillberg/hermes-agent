@@ -709,7 +709,7 @@ class TestPerSessionMigrateGuard:
     containing only <prior_memory_file> wrappers.
     """
 
-    def _make_provider_with_strategy(self, strategy, init_on_session_start=True):
+    def _make_provider_with_strategy(self, strategy, init_on_session_start=True, home=None, **init_kwargs):
         """Create a HonchoMemoryProvider and track migrate_memory_files calls."""
         from plugins.memory.honcho.client import HonchoClientConfig
         from unittest.mock import patch, MagicMock
@@ -728,12 +728,13 @@ class TestPerSessionMigrateGuard:
         mock_session = MagicMock()
         mock_session.messages = []  # empty = new session → triggers migration path
         mock_manager.get_or_create.return_value = mock_session
+        home = home or MagicMock()
 
         with patch("plugins.memory.honcho.client.HonchoClientConfig.from_global_config", return_value=cfg), \
              patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()), \
              patch("plugins.memory.honcho.session.HonchoSessionManager", return_value=mock_manager), \
-             patch("hermes_constants.get_hermes_home", return_value=MagicMock()):
-            provider.initialize(session_id="test-session-001")
+             patch("hermes_constants.get_hermes_home", return_value=home):
+            provider.initialize(session_id="test-session-001", **init_kwargs)
 
         return provider, mock_manager
 
@@ -746,6 +747,19 @@ class TestPerSessionMigrateGuard:
         """per-directory strategy with empty session SHOULD call migrate_memory_files."""
         _, mock_manager = self._make_provider_with_strategy("per-directory")
         mock_manager.migrate_memory_files.assert_called_once()
+
+    def test_scoped_gateway_migration_uses_scoped_memory_dir(self, tmp_path):
+        """Scoped gateway sessions must not import global MEMORY.md/USER.md."""
+        _, mock_manager = self._make_provider_with_strategy(
+            "per-directory",
+            home=tmp_path,
+            memory_scope="discord:guild/123:user",
+        )
+
+        mock_manager.migrate_memory_files.assert_called_once()
+        assert mock_manager.migrate_memory_files.call_args.args[1] == str(
+            tmp_path / "memories" / "discord:guild_123:user"
+        )
 
 
 class TestChunkMessage:

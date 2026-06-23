@@ -802,6 +802,48 @@ async def test_fetch_channel_context_ignores_stale_cache(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fetch_channel_context_filters_to_triggering_author(adapter):
+    alice = SimpleNamespace(id=42, display_name="Alice", name="Alice", bot=False)
+    bob = SimpleNamespace(id=43, display_name="Bob", name="Bob", bot=False)
+
+    channel = FakeHistoryChannel(
+        [
+            make_history_message(author=bob, content="bob private context", msg_id=50),
+            make_history_message(author=alice, content="alice context", msg_id=51),
+        ],
+        channel_id=777,
+    )
+    trigger = make_message(channel=channel, content="trigger")
+    trigger.id = 100
+
+    result = await adapter._fetch_channel_context(channel, before=trigger, author_id="42")
+
+    assert "[Alice] alice context" in result
+    assert "bob private context" not in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_context_can_still_fetch_unfiltered_when_called_directly(adapter):
+    alice = SimpleNamespace(id=42, display_name="Alice", name="Alice", bot=False)
+    bob = SimpleNamespace(id=43, display_name="Bob", name="Bob", bot=False)
+
+    channel = FakeHistoryChannel(
+        [
+            make_history_message(author=bob, content="bob shared context", msg_id=50),
+            make_history_message(author=alice, content="alice context", msg_id=51),
+        ],
+        channel_id=777,
+    )
+    trigger = make_message(channel=channel, content="trigger")
+    trigger.id = 100
+
+    result = await adapter._fetch_channel_context(channel, before=trigger)
+
+    assert "[Bob] bob shared context" in result
+    assert "[Alice] alice context" in result
+
+
+@pytest.mark.asyncio
 async def test_discord_shared_channel_backfill_prepends_context(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
@@ -820,6 +862,7 @@ async def test_discord_shared_channel_backfill_prepends_context(adapter, monkeyp
     await adapter._handle_message(message)
 
     adapter._fetch_channel_context.assert_awaited_once()
+    assert adapter._fetch_channel_context.await_args.kwargs["author_id"] == "42"
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "hello with mention"
     assert event.channel_context == "[Recent channel messages]\n[Alice] context"
@@ -846,6 +889,7 @@ async def test_discord_per_user_channel_backfills_too(adapter, monkeypatch):
     await adapter._handle_message(message)
 
     adapter._fetch_channel_context.assert_awaited_once()
+    assert adapter._fetch_channel_context.await_args.kwargs["author_id"] == "42"
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "hello with mention"
     assert event.channel_context == "[Recent channel messages]\n[Alice] context"
@@ -867,6 +911,7 @@ async def test_discord_participated_thread_backfills_without_mention(adapter, mo
     await adapter._handle_message(message)
 
     adapter._fetch_channel_context.assert_awaited_once()
+    assert adapter._fetch_channel_context.await_args.kwargs["author_id"] == "42"
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "follow-up without mention"
     assert event.channel_context == "[Recent channel messages]\n[Alice] thread context"
@@ -925,5 +970,3 @@ async def test_discord_auto_thread_skips_backfill(adapter, monkeypatch):
 
     adapter._auto_create_thread.assert_awaited_once()
     adapter._fetch_channel_context.assert_not_awaited()
-
-

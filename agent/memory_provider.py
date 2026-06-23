@@ -77,6 +77,7 @@ class MemoryProvider(ABC):
             per-profile provider identity scoping.
           - agent_workspace (str): Shared workspace name (e.g. "hermes").
           - parent_session_id (str): For subagents, the parent's session_id.
+          - memory_scope (str): Stable tenant+user key for gateway memory.
           - user_id (str): Platform user identifier (gateway sessions).
           - user_id_alt (str): Optional alternate stable platform user identifier.
         """
