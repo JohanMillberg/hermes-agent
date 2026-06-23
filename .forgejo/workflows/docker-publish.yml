@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: "self-hosted:docker://node:20-bookworm-slim"
+    runs-on: [self-hosted, linux, amd64]
     env:
       DOCKER_HOST: tcp://localhost:2375
       IMAGE_REPO: forgejo.lan/kvarnberg/hermes-agent
