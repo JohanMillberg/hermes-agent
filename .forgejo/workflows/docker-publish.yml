@@ -15,6 +15,7 @@ jobs:
     env:
       DOCKER_HOST: tcp://localhost:2375
       IMAGE_REPO: forgejo.lan/kvarnberg/hermes-agent
+      PUSH_REPO: 10.43.4.61:3000/kvarnberg/hermes-agent
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,11 +36,13 @@ jobs:
           set -eu
           tag="main-$(printf '%.9s' "$GITHUB_SHA")"
           image="${IMAGE_REPO}:${tag}"
-          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login forgejo.lan -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin
+          push_image="${PUSH_REPO}:${tag}"
+          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login 10.43.4.61:3000 -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin
           docker build \
             --build-arg "HERMES_GIT_SHA=${GITHUB_SHA}" \
             -t "${image}" \
             -f Dockerfile \
             .
-          docker push "${image}"
+          docker tag "${image}" "${push_image}"
+          docker push "${push_image}"
           echo "Pushed ${image}"
