@@ -733,7 +733,11 @@ export const zh: Translations = {
       cloudOrgChange: '切换组织',
       cloudOrgRole: role => `角色：${role}`,
       cloudLoadingAgents: '正在加载你的智能体…',
-      cloudNoAgents: '此账户下未找到智能体。请在 Nous 门户中创建一个，然后刷新。',
+      cloudNoAgents: {
+        before: '此账户下未找到智能体。请在',
+        linkText: 'Nous 门户',
+        after: '中创建一个，然后刷新。'
+      },
       cloudRefresh: '刷新',
       cloudConnect: '连接',
       cloudConnecting: '正在连接…',

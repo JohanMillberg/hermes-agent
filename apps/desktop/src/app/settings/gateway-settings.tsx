@@ -10,6 +10,7 @@ import type {
   DesktopConnectionProbeResult
 } from '@/global'
 import { useI18n } from '@/i18n'
+import { ExternalLink } from '@/lib/external-link'
 import { AlertCircle, Check, Cloud, FileText, Globe, Loader2, LogIn, Monitor, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
@@ -795,7 +796,13 @@ export function GatewaySettings() {
               ) : cloudAgents.length === 0 ? (
                 <div className="flex items-start gap-2 py-3 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
                   <AlertCircle className="mt-0.5 size-4 shrink-0" />
-                  {g.cloudNoAgents}
+                  <span>
+                    {g.cloudNoAgents.before}
+                    <ExternalLink href="https://portal.nousresearch.com/agents" showExternalIcon={false}>
+                      {g.cloudNoAgents.linkText}
+                    </ExternalLink>
+                    {g.cloudNoAgents.after}
+                  </span>
                 </div>
               ) : (
                 <div className="grid gap-1">

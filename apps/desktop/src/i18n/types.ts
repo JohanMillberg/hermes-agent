@@ -455,7 +455,7 @@ export interface Translations {
       cloudOrgChange: string
       cloudOrgRole: (role: string) => string
       cloudLoadingAgents: string
-      cloudNoAgents: string
+      cloudNoAgents: { before: string; linkText: string; after: string }
       cloudRefresh: string
       cloudConnect: string
       cloudConnecting: string

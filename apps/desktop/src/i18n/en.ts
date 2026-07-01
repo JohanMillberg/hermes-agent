@@ -544,7 +544,11 @@ export const en: Translations = {
       cloudOrgChange: 'Change org',
       cloudOrgRole: role => `Role: ${role}`,
       cloudLoadingAgents: 'Loading your agents…',
-      cloudNoAgents: 'No agents found on this account. Create one in the Nous portal, then refresh.',
+      cloudNoAgents: {
+        before: 'No agents found on this account. Create one in the ',
+        linkText: 'Nous portal',
+        after: ', then refresh.'
+      },
       cloudRefresh: 'Refresh',
       cloudConnect: 'Connect',
       cloudConnecting: 'Connecting…',
