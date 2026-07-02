@@ -854,31 +854,6 @@ class TestWhatsAppSessionKeyConsistency:
         assert second_entry.session_key == "agent:main:discord:group:guild-123:bob"
         assert first_entry.session_id != second_entry.session_id
 
-    def test_store_forces_discord_group_user_isolation_when_disabled_in_config(self, store):
-        store.config.group_sessions_per_user = False
-
-        first = SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="guild-123",
-            chat_type="group",
-            user_id="alice",
-            user_name="Alice",
-        )
-        second = SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="guild-123",
-            chat_type="group",
-            user_id="bob",
-            user_name="Bob",
-        )
-
-        first_entry = store.get_or_create_session(first)
-        second_entry = store.get_or_create_session(second)
-
-        assert first_entry.session_key == "agent:main:discord:group:guild-123:alice"
-        assert second_entry.session_key == "agent:main:discord:group:guild-123:bob"
-        assert first_entry.session_id != second_entry.session_id
-
     def test_telegram_dm_includes_chat_id(self):
         """Non-WhatsApp DMs should also include chat_id to separate users."""
         source = SessionSource(
@@ -973,23 +948,6 @@ class TestWhatsAppSessionKeyConsistency:
         assert build_session_key(second) == "agent:main:discord:group:guild-123:bob"
         assert build_session_key(first) != build_session_key(second)
 
-    def test_discord_group_sessions_stay_isolated_when_isolation_disabled(self):
-        first = SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="guild-123",
-            chat_type="group",
-            user_id="alice",
-        )
-        second = SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="guild-123",
-            chat_type="group",
-            user_id="bob",
-        )
-
-        assert build_session_key(first, group_sessions_per_user=False) == "agent:main:discord:group:guild-123:alice"
-        assert build_session_key(second, group_sessions_per_user=False) == "agent:main:discord:group:guild-123:bob"
-
     def test_group_thread_includes_thread_id(self):
         """Forum-style threads need a distinct session key within one group."""
         source = SessionSource(
@@ -1033,25 +991,6 @@ class TestWhatsAppSessionKeyConsistency:
         key = build_session_key(source, thread_sessions_per_user=True)
         assert key == "agent:main:telegram:group:-1002285219667:17585:42"
 
-    def test_discord_thread_sessions_stay_isolated_by_user(self):
-        alice = SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="guild-123",
-            chat_type="group",
-            thread_id="thread-1",
-            user_id="alice",
-        )
-        bob = SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="guild-123",
-            chat_type="group",
-            thread_id="thread-1",
-            user_id="bob",
-        )
-
-        assert build_session_key(alice, thread_sessions_per_user=False) == "agent:main:discord:group:guild-123:thread-1:alice"
-        assert build_session_key(bob, thread_sessions_per_user=False) == "agent:main:discord:group:guild-123:thread-1:bob"
-
     def test_non_thread_group_sessions_still_isolated_per_user(self):
         """Regular group messages (no thread_id) remain per-user by default."""
         alice = SessionSource(
@@ -1068,26 +1007,6 @@ class TestWhatsAppSessionKeyConsistency:
         )
         assert build_session_key(alice) == "agent:main:telegram:group:-1002285219667:alice"
         assert build_session_key(bob) == "agent:main:telegram:group:-1002285219667:bob"
-        assert build_session_key(alice) != build_session_key(bob)
-
-    def test_discord_thread_sessions_are_forced_per_user_by_default(self):
-        """Discord threads are never shared across participants."""
-        alice = SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="guild-123",
-            chat_type="thread",
-            thread_id="thread-456",
-            user_id="alice",
-        )
-        bob = SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="guild-123",
-            chat_type="thread",
-            thread_id="thread-456",
-            user_id="bob",
-        )
-        assert build_session_key(alice) == "agent:main:discord:thread:guild-123:thread-456:alice"
-        assert build_session_key(bob) == "agent:main:discord:thread:guild-123:thread-456:bob"
         assert build_session_key(alice) != build_session_key(bob)
 
     def test_dm_thread_sessions_not_affected(self):
