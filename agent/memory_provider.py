@@ -28,6 +28,7 @@ Optional hooks (override to opt in):
   on_pre_compress(messages) -> str       — extract before context compression
   on_memory_write(action, target, content, metadata=None) — mirror built-in memory writes
   on_delegation(task, result, **kwargs)  — parent-side observation of subagent work
+  backup_paths() -> list[str]            — extra on-disk paths to include in `hermes backup`
 """
 
 from __future__ import annotations
@@ -179,6 +180,7 @@ class MemoryProvider(ABC):
         *,
         parent_session_id: str = "",
         reset: bool = False,
+        rewound: bool = False,
         **kwargs,
     ) -> None:
         """Called when the agent switches session_id mid-process.
@@ -208,6 +210,10 @@ class MemoryProvider(ABC):
             (``_session_turns``, ``_turn_counter``, etc.) when this is
             set. ``False`` for ``/resume`` / ``/branch`` / compression
             where the logical conversation continues under the new id.
+        rewound:
+            ``True`` if session_id is unchanged but the transcript was
+            truncated; providers caching per-turn document state should
+            invalidate.
 
         Default is no-op for backward compatibility.
         """
@@ -290,3 +296,21 @@ class MemoryProvider(ABC):
 
         Use to mirror built-in memory writes to your backend.
         """
+
+    def backup_paths(self) -> List[str]:
+        """Return extra on-disk paths this provider stores OUTSIDE HERMES_HOME.
+
+        ``hermes backup`` only walks HERMES_HOME, so any provider state kept
+        under ``~/.honcho``, ``~/.hindsight``, ``~/.openviking``, etc. is lost
+        across a backup/import cycle unless it's declared here.
+
+        Return a list of absolute path strings (files or directories). The
+        backup command resolves each, captures the ones that exist and live
+        under the user's home directory into a reserved ``_external/`` subtree
+        of the archive, and ``hermes import`` restores them to their original
+        locations. Paths outside the home directory are skipped for safety.
+
+        MUST be callable without ``initialize()`` and without network — resolve
+        from config/env only. Default returns an empty list (nothing external).
+        """
+        return []
