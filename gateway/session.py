@@ -860,11 +860,11 @@ def build_session_key(
     if source.thread_id:
         key_parts.append(source.thread_id)
 
-    # In non-Discord threads, default to shared sessions (all participants see the same
+    # In threads, default to shared sessions (all participants see the same
     # conversation).  Per-user isolation only applies when explicitly enabled
     # via thread_sessions_per_user, or when there is no thread (regular group).
-    isolate_user = True if source.platform == Platform.DISCORD else group_sessions_per_user
-    if source.thread_id and not thread_sessions_per_user and source.platform != Platform.DISCORD:
+    isolate_user = group_sessions_per_user
+    if source.thread_id and not thread_sessions_per_user:
         isolate_user = False
 
     if isolate_user and participant_id:
