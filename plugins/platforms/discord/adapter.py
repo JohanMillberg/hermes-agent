@@ -4955,6 +4955,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 # needed for cold start.)
                 if msg.author == self._client.user:
                     break
+                if author_id and str(getattr(msg.author, "id", "")) != str(author_id):
+                    continue
                 line = _keep(msg)
                 if line is None:
                     continue
@@ -4962,9 +4964,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 collected.append((mid, line))
                 if mid:
                     seen_ids.add(mid)
-
-                if author_id and str(getattr(msg.author, "id", "")) != str(author_id):
-                    continue
 
             # ── Reply window: context around the message the user pointed at ──
             # When the user replied to a specific message that sits BEFORE the

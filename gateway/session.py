@@ -755,8 +755,6 @@ def is_shared_multi_user_session(
     """
     if source.chat_type == "dm":
         return False
-    if source.platform == Platform.DISCORD:
-        return False
     if source.thread_id:
         return not thread_sessions_per_user
     return not group_sessions_per_user
