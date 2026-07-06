@@ -1409,6 +1409,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    user_id=getattr(agent, "_user_id", "") or "",
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1451,6 +1452,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    user_id=getattr(agent, "_user_id", "") or "",
                 )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
