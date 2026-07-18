@@ -1009,6 +1009,26 @@ class TestWhatsAppSessionKeyConsistency:
         assert build_session_key(bob) == "agent:main:telegram:group:-1002285219667:bob"
         assert build_session_key(alice) != build_session_key(bob)
 
+    def test_discord_group_sessions_shared_when_isolation_disabled(self):
+        """Discord follows group_sessions_per_user like every other platform —
+        no platform-specific override (49785718a). Mirrors the shared-key
+        assertion upstream makes for non-Discord platforms."""
+        alice = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="guild-123",
+            chat_type="group",
+            user_id="alice",
+        )
+        bob = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="guild-123",
+            chat_type="group",
+            user_id="bob",
+        )
+        assert build_session_key(alice, group_sessions_per_user=False) == "agent:main:discord:group:guild-123"
+        assert build_session_key(bob, group_sessions_per_user=False) == "agent:main:discord:group:guild-123"
+        assert build_session_key(alice, group_sessions_per_user=False) == build_session_key(bob, group_sessions_per_user=False)
+
     def test_dm_thread_sessions_not_affected(self):
         """DM threads use their own keying logic and are not affected."""
         source = SessionSource(

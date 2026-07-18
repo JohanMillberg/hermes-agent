@@ -43,6 +43,9 @@ import httpx
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 
 
+_TRANSIENT_RETRY_BACKOFF_SECONDS = 1.0
+
+
 def _is_retryable_vision_provider_error(error: Exception) -> bool:
     """Return True for transient provider-side vision failures worth one retry."""
     err = str(error).lower()
@@ -1151,6 +1154,10 @@ async def vision_analyze_tool(
                     "Vision provider request failed transiently; retrying once: %s",
                     _api_err,
                 )
+                # Brief backoff — these errors (overload, gateway hiccups) tend to
+                # cluster, so retrying in the same instant often just repeats the
+                # failure.
+                await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SECONDS)
                 response = await async_call_llm(**call_kwargs)
             else:
                 raise

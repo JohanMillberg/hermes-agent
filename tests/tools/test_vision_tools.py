@@ -18,6 +18,7 @@ from tools.vision_tools import (
     _image_exceeds_dimension,
     _EMBED_MAX_DIMENSION,
     _is_image_size_error,
+    _is_retryable_vision_provider_error,
     _MAX_BASE64_BYTES,
     _RESIZE_TARGET_BYTES,
     vision_analyze_tool,
@@ -731,6 +732,87 @@ class TestErrorClassification:
         assert result["success"] is False
         assert "rejected the image" in result["analysis"].lower()
         assert "smaller" in result["analysis"].lower()
+
+
+class TestIsRetryableVisionProviderError:
+    """Classification for the narrow transient-failure retry (835a99de6)."""
+
+    @pytest.mark.parametrize("message", [
+        "upstream request failed",
+        "Provider returned an empty stream",
+        "malformed SSE response",
+        "model overloaded, please retry",
+        "service temporarily unavailable",
+        "503 Service Unavailable",
+        "502 Bad Gateway",
+        "504 Gateway Timeout",
+        "request timed out after 30s",
+        "connection reset by peer",
+    ])
+    def test_retryable_messages(self, message):
+        assert _is_retryable_vision_provider_error(Exception(message))
+
+    @pytest.mark.parametrize("message", [
+        "401 Unauthorized",
+        "invalid_request_error: image too big",
+        "model not found",
+        "",
+    ])
+    def test_non_retryable_messages(self, message):
+        assert not _is_retryable_vision_provider_error(Exception(message))
+
+
+class TestTransientProviderRetry:
+    """vision_analyze_tool retries once (with backoff) on a transient
+    provider error, and does not retry on a non-retryable error."""
+
+    @pytest.mark.asyncio
+    async def test_retries_once_after_transient_error_and_succeeds(self, tmp_path):
+        img = tmp_path / "test.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "A cat"
+
+        with (
+            patch(
+                "tools.vision_tools._image_to_base64_data_url",
+                return_value="data:image/png;base64,abc",
+            ),
+            patch(
+                "tools.vision_tools.async_call_llm",
+                new_callable=AsyncMock,
+                side_effect=[Exception("upstream request failed"), mock_response],
+            ) as mock_llm,
+            patch("tools.vision_tools.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            result = json.loads(await vision_analyze_tool(str(img), "describe", "test/model"))
+
+        assert result["success"] is True
+        assert mock_llm.await_count == 2
+        mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_retryable_error_fails_without_second_call(self, tmp_path):
+        img = tmp_path / "test.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+
+        with (
+            patch(
+                "tools.vision_tools._image_to_base64_data_url",
+                return_value="data:image/png;base64,abc",
+            ),
+            patch(
+                "tools.vision_tools.async_call_llm",
+                new_callable=AsyncMock,
+                side_effect=Exception("401 Unauthorized"),
+            ) as mock_llm,
+        ):
+            result = json.loads(await vision_analyze_tool(str(img), "describe", "test/model"))
+
+        assert result["success"] is False
+        assert mock_llm.await_count == 1
 
 
 class TestVisionRegistration:
