@@ -852,7 +852,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
-                result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
+                _preview_limit = 2000
+                result_preview = _err_text[:_preview_limit] if len(_err_text) > _preview_limit else _err_text
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
             # Track file-mutation outcome for the turn-end verifier.
@@ -1476,7 +1477,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
-                function_result[:200] if len(function_result) > 200 else function_result
+                function_result[:2000] if len(function_result) > 2000 else function_result
             )
             _result_len = len(function_result)
         else:
@@ -1517,7 +1518,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 failed=_is_error_result,
             )
             result_preview = function_result if agent.verbose_logging else (
-                function_result[:200] if len(function_result) > 200 else function_result
+                function_result[:2000] if len(function_result) > 2000 else function_result
             )
         if _is_error_result:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)

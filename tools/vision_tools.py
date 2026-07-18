@@ -41,6 +41,23 @@ from typing import Any, Awaitable, Dict, Optional
 from urllib.parse import urlparse
 import httpx
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+
+
+def _is_retryable_vision_provider_error(error: Exception) -> bool:
+    """Return True for transient provider-side vision failures worth one retry."""
+    err = str(error).lower()
+    return any(hint in err for hint in (
+        "upstream request failed",
+        "provider returned an empty stream",
+        "malformed sse response",
+        "overloaded",
+        "temporarily unavailable",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "timed out",
+        "connection reset",
+    ))
 from hermes_constants import get_hermes_dir
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
@@ -1111,6 +1128,8 @@ async def vision_analyze_tool(
         if model:
             call_kwargs["model"] = model
         # Try full-size image first; on size-related rejection, downscale and retry.
+        # Also retry once for narrow transient provider-side failures that
+        # aggregators sometimes wrap in misleading 400 errors.
         try:
             response = await async_call_llm(**call_kwargs)
         except Exception as _api_err:
@@ -1126,6 +1145,12 @@ async def vision_analyze_tool(
                     _resize_image_for_vision,
                     temp_image_path, mime_type=detected_mime_type)
                 messages[0]["content"][1]["image_url"]["url"] = image_data_url
+                response = await async_call_llm(**call_kwargs)
+            elif _is_retryable_vision_provider_error(_api_err):
+                logger.warning(
+                    "Vision provider request failed transiently; retrying once: %s",
+                    _api_err,
+                )
                 response = await async_call_llm(**call_kwargs)
             else:
                 raise
