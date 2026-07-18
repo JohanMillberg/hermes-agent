@@ -2868,6 +2868,7 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
+                user_id=getattr(agent, "_user_id", "") or "",
             )
             assert result == "result"
 
