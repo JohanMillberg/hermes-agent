@@ -2250,6 +2250,80 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _self_heal_dead_provider_to_opencode(
+    job: dict, cfg: dict, auth_exc: Exception, job_id: str, job_name: str
+) -> Optional[tuple[dict, str]]:
+    """Auto-migrate a job whose pinned provider is no longer usable to opencode-go.
+
+    Two engagement paths, both retargeting ONLY to opencode-go (never an
+    arbitrary provider that could spend money without consent — the #44585 spend
+    guard's concern):
+
+    - ``invalid_provider`` (ungated): the provider name itself is unknown — the
+      unambiguous signal of a stale job left by a provider rename/switch (e.g.
+      luna -> opencode-go).
+    - missing/unconfigured credentials for a KNOWN provider (gated): ambiguous
+      (could be a rolled key), so only auto-heals when the operator has opted in
+      via ``cron.self_heal_missing_credentials`` in config.yaml. Rate-limited
+      failures are never healed (transient). Without the opt-in, the job is left
+      for ``cron edit``.
+
+    The configured default must be opencode-go. The job is updated in-place via
+    the locked ``update_job`` path (re-validated, snapshots refreshed) so later
+    ticks resolve on the primary path and never re-enter this branch. Returns
+    ``(runtime, model)`` on success, else ``None``.
+    """
+    code = getattr(auth_exc, "code", None)
+    if code == "invalid_provider":
+        reason = "unknown provider"
+    else:
+        from hermes_cli.auth import is_rate_limited_auth_error
+        # Transient rate-limiting must not permanently retarget a job.
+        if is_rate_limited_auth_error(auth_exc):
+            return None
+        # Missing/unconfigured credentials for a KNOWN provider (e.g. an old
+        # anthropic-pinned job after a switch) are a stale-job signal too, but
+        # ambiguous (could be a rolled key) — only auto-heal when the operator
+        # has explicitly opted in. Otherwise leave it to `cron edit`.
+        if not (cfg or {}).get("cron", {}).get("self_heal_missing_credentials"):
+            return None
+        reason = "missing credentials"
+    model_cfg = (cfg or {}).get("model") or {}
+    if not isinstance(model_cfg, dict):
+        return None
+    if str(model_cfg.get("provider") or "").strip().lower() != "opencode-go":
+        return None  # constrain auto-migration to opencode-go only
+    cfg_model = model_cfg.get("default") or model_cfg.get("model")
+    cfg_base_url = model_cfg.get("base_url")
+    if not cfg_model:
+        return None
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from cron.jobs import update_job
+
+    try:
+        rt_kwargs = {"requested": "opencode-go"}
+        if cfg_base_url:
+            rt_kwargs["explicit_base_url"] = cfg_base_url
+        runtime = resolve_runtime_provider(**rt_kwargs)
+    except Exception:
+        return None  # opencode-go not actually usable — don't migrate to a dead target
+    old_provider = job.get("provider")
+    try:
+        update_job(
+            job_id,
+            {"provider": "opencode-go", "model": cfg_model, "base_url": cfg_base_url},
+        )
+    except Exception as exc:
+        logger.warning("Job '%s': opencode-go self-heal update failed: %s", job_id, exc)
+        return None
+    logger.warning(
+        "Job '%s' ('%s'): pinned provider '%s' no longer usable (%s); "
+        "auto-migrated to opencode-go (model='%s').",
+        job_id, job_name, old_provider, reason, cfg_model,
+    )
+    return runtime, str(cfg_model)
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2699,7 +2773,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 except Exception as fb_exc:
                     logger.debug("Job '%s': fallback %s failed: %s", job_id, entry.get("provider"), fb_exc)
             if runtime is None:
-                raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+                healed = _self_heal_dead_provider_to_opencode(
+                    job, _cfg, auth_exc, job_id, job_name
+                )
+                if healed is not None:
+                    runtime, model = healed
+                    job["provider"] = "opencode-go"
+                    job["model"] = model
+                else:
+                    raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc

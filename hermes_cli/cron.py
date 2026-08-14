@@ -373,6 +373,9 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        provider=getattr(args, "provider", None),
+        model=getattr(args, "model", None),
+        base_url=getattr(args, "base_url", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))

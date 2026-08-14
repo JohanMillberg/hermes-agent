@@ -134,6 +134,22 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
     )
+    # Inference pinning — migrate a job to a new provider/model after a switch
+    # (e.g. luna -> opencode-go) without recreating it. Empty string clears the
+    # pin so the job follows the global default. The update path re-validates
+    # the effective provider/base_url pair (credential-exfil guard).
+    cron_edit.add_argument(
+        "--provider",
+        help="Pin or override the job's inference provider (e.g. 'opencode-go'). Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--model",
+        help="Pin or override the job's model. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--base-url",
+        help="Pin or override the job's inference base URL. Pass empty string to clear.",
+    )
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

@@ -85,6 +85,73 @@ class TestCronCommandLifecycle:
         out = capsys.readouterr().out
         assert "Updated job" in out
 
+    def test_edit_can_pin_and_clear_provider_model_base_url(
+        self, tmp_cron_dir, capsys, monkeypatch
+    ):
+        # Simulate a stale job pinned to a provider that no longer exists.
+        job = create_job(
+            prompt="Morning brief",
+            schedule="every 1h",
+            provider="luna",
+            model="gpt-5.6",
+        )
+        # The base_url exfil guard is environment-dependent (it host-matches
+        # against PROVIDER_REGISTRY / the configured credential pool, neither
+        # present in a clean test dir) and is covered by its own tests. Stub it
+        # so this wiring test stays hermetic.
+        monkeypatch.setattr(
+            "tools.cronjob_tools._validate_cron_base_url",
+            lambda provider, base_url: None,
+        )
+
+        cron_command(
+            Namespace(
+                cron_command="edit",
+                job_id=job["id"],
+                schedule=None,
+                prompt=None,
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                clear_skills=False,
+                provider="opencode-go",
+                model="gpt-5.6-luna",
+                base_url="https://opencode.ai/zen/go/v1",
+            )
+        )
+        updated = get_job(job["id"])
+        assert updated["provider"] == "opencode-go"
+        assert updated["model"] == "gpt-5.6-luna"
+        assert updated["base_url"] == "https://opencode.ai/zen/go/v1"
+
+        # Empty string clears the pins so the job follows the global default.
+        cron_command(
+            Namespace(
+                cron_command="edit",
+                job_id=job["id"],
+                schedule=None,
+                prompt=None,
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                clear_skills=False,
+                provider="",
+                model="",
+                base_url="",
+            )
+        )
+        cleared = get_job(job["id"])
+        assert cleared["provider"] is None
+        assert cleared["model"] is None
+        assert cleared["base_url"] is None
+
+        out = capsys.readouterr().out
+        assert "Updated job" in out
+
     def test_create_with_multiple_skills(self, tmp_cron_dir, capsys):
         cron_command(
             Namespace(

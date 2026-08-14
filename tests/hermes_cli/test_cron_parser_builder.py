@@ -70,6 +70,24 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
 
 
+def test_cron_edit_inference_pin_flags():
+    parser = _build()
+    ns = parser.parse_args([
+        "cron", "edit", "j",
+        "--provider", "opencode-go",
+        "--model", "gpt-5.6-luna",
+        "--base-url", "https://opencode.ai/zen/go/v1",
+    ])
+    assert ns.provider == "opencode-go"
+    assert ns.model == "gpt-5.6-luna"
+    assert ns.base_url == "https://opencode.ai/zen/go/v1"
+    # Omitted -> None: the field is left untouched (not cleared).
+    ns2 = parser.parse_args(["cron", "edit", "j"])
+    assert ns2.provider is None
+    assert ns2.model is None
+    assert ns2.base_url is None
+
+
 def test_cron_dispatch_func_is_injected_handler():
     parser = _build()
     ns = parser.parse_args(["cron", "list"])

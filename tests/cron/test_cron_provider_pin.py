@@ -334,3 +334,171 @@ class TestModelDriftGuard:
             )
         assert agent_constructed is True
         assert success is True
+
+
+class TestDeadProviderSelfHeal:
+    """Auto-migration of stale pinned providers to opencode-go.
+
+    When a job's pinned provider no longer resolves (``invalid_provider`` — the
+    signature of a stale job left by a provider rename/switch), the run_job
+    fallback path retargets it to opencode-go in-place — but ONLY when the
+    configured default is opencode-go, never an arbitrary (potentially paid)
+    target. These tests exercise the helper directly; the run_job wiring is
+    covered by TestProviderDriftGuard's mock stack.
+    """
+
+    @pytest.fixture()
+    def tmp_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+        return tmp_path
+
+    @staticmethod
+    def _cfg(provider="opencode-go", model="gpt-5.6-luna",
+             base_url="https://opencode.ai/zen/go/v1",
+             self_heal_missing_credentials=False):
+        cfg = {"model": {"provider": provider, "default": model, "base_url": base_url}}
+        if self_heal_missing_credentials:
+            cfg["cron"] = {"self_heal_missing_credentials": True}
+        return cfg
+
+    def test_migrates_invalid_provider_to_opencode(self, tmp_cron_dir):
+        from cron.jobs import create_job, get_job
+        from cron.scheduler import _self_heal_dead_provider_to_opencode
+        from hermes_cli.auth import AuthError
+
+        job = create_job(
+            prompt="brief", schedule="every 1h", provider="luna", model="gpt-5.6",
+        )
+        fake_rt = {
+            "provider": "opencode-go", "api_key": "k",
+            "base_url": "https://opencode.ai/zen/go/v1", "api_mode": "chat_completions",
+        }
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=fake_rt,
+        ):
+            result = _self_heal_dead_provider_to_opencode(
+                job, self._cfg(), AuthError("unknown provider", code="invalid_provider"),
+                job["id"], "brief",
+            )
+        assert result == (fake_rt, "gpt-5.6-luna")
+        healed = get_job(job["id"])
+        assert healed["provider"] == "opencode-go"
+        assert healed["model"] == "gpt-5.6-luna"
+        assert healed["base_url"] == "https://opencode.ai/zen/go/v1"
+
+    def test_skips_missing_credentials_without_opt_in(self, tmp_cron_dir):
+        from cron.jobs import create_job, get_job
+        from cron.scheduler import _self_heal_dead_provider_to_opencode
+        from hermes_cli.auth import AuthError
+
+        # A known provider with no key (code=None, the default for these errors)
+        # is ambiguous — could be a rolled key — so it is NOT auto-healed unless
+        # the operator opts in. Left for `cron edit`.
+        job = create_job(
+            prompt="brief", schedule="every 1h", provider="anthropic",
+            model="claude-sonnet-4",
+        )
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={"provider": "opencode-go"},
+        ):
+            result = _self_heal_dead_provider_to_opencode(
+                job, self._cfg(), AuthError("No Anthropic credentials found"),
+                job["id"], "brief",
+            )
+        assert result is None
+        assert get_job(job["id"])["provider"] == "anthropic"
+
+    def test_migrates_missing_credentials_when_opted_in(self, tmp_cron_dir):
+        from cron.jobs import create_job, get_job
+        from cron.scheduler import _self_heal_dead_provider_to_opencode
+        from hermes_cli.auth import AuthError
+
+        job = create_job(
+            prompt="brief", schedule="every 1h", provider="anthropic",
+            model="claude-sonnet-4",
+        )
+        fake_rt = {
+            "provider": "opencode-go", "api_key": "k",
+            "base_url": "https://opencode.ai/zen/go/v1", "api_mode": "chat_completions",
+        }
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=fake_rt,
+        ):
+            result = _self_heal_dead_provider_to_opencode(
+                job, self._cfg(self_heal_missing_credentials=True),
+                AuthError("No Anthropic credentials found"),
+                job["id"], "brief",
+            )
+        assert result == (fake_rt, "gpt-5.6-luna")
+        healed = get_job(job["id"])
+        assert healed["provider"] == "opencode-go"
+        assert healed["model"] == "gpt-5.6-luna"
+
+    def test_skips_rate_limited_even_when_opted_in(self, tmp_cron_dir):
+        from cron.jobs import create_job, get_job
+        from cron.scheduler import _self_heal_dead_provider_to_opencode
+        from hermes_cli.auth import AuthError
+
+        # Transient rate-limiting must never permanently retarget a job, even
+        # with the opt-in: the limit clears, but a migration would not.
+        job = create_job(
+            prompt="brief", schedule="every 1h", provider="anthropic",
+            model="claude-sonnet-4",
+        )
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={"provider": "opencode-go"},
+        ):
+            result = _self_heal_dead_provider_to_opencode(
+                job, self._cfg(self_heal_missing_credentials=True),
+                AuthError("rate limited", code="codex_rate_limited"),
+                job["id"], "brief",
+            )
+        assert result is None
+        assert get_job(job["id"])["provider"] == "anthropic"
+
+    def test_skips_when_default_provider_is_not_opencode(self, tmp_cron_dir):
+        from cron.jobs import create_job, get_job
+        from cron.scheduler import _self_heal_dead_provider_to_opencode
+        from hermes_cli.auth import AuthError
+
+        job = create_job(
+            prompt="brief", schedule="every 1h", provider="luna", model="gpt-5.6",
+        )
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={"provider": "nous"},
+        ):
+            result = _self_heal_dead_provider_to_opencode(
+                job, self._cfg(provider="nous", model="paid-model"),
+                AuthError("unknown provider", code="invalid_provider"),
+                job["id"], "brief",
+            )
+        assert result is None
+        # Never auto-migrate to a non-opencode (potentially paid) target.
+        assert get_job(job["id"])["provider"] == "luna"
+
+    def test_skips_when_opencode_not_resolvable(self, tmp_cron_dir):
+        from cron.jobs import create_job, get_job
+        from cron.scheduler import _self_heal_dead_provider_to_opencode
+        from hermes_cli.auth import AuthError
+
+        job = create_job(
+            prompt="brief", schedule="every 1h", provider="luna", model="gpt-5.6",
+        )
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=AuthError("no opencode", code="invalid_provider"),
+        ):
+            result = _self_heal_dead_provider_to_opencode(
+                job, self._cfg(), AuthError("unknown provider", code="invalid_provider"),
+                job["id"], "brief",
+            )
+        assert result is None
+        # Don't migrate to a target that itself can't resolve.
+        assert get_job(job["id"])["provider"] == "luna"
