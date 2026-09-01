@@ -90,6 +90,22 @@ def detect_terminal_graphics() -> str:
     return "unicode"
 
 
+def supports_kitty_placeholders() -> bool:
+    """True when the terminal can paint kitty Unicode placeholders (U+10EEEE).
+
+    Narrower than ``detect_terminal_graphics() == "kitty"``. WezTerm speaks
+    kitty APC transmits but does not implement the placeholder grid, so those
+    cells render as tofu. Ghostty and kitty do. VS Code already falls out of
+    ``detect_terminal_graphics`` as ``unicode``.
+    """
+    if detect_terminal_graphics() != "kitty":
+        return False
+    term_program = os.environ.get("TERM_PROGRAM", "").lower()
+    if term_program == "wezterm" or os.environ.get("WEZTERM_PANE"):
+        return False
+    return True
+
+
 def resolve_mode(configured: str | None, *, stream=None) -> str:
     """Resolve the effective render mode from config + the environment.
 
@@ -423,7 +439,7 @@ def _encode_iterm(frame, *, cell_cols: int | None = None, cell_rows: int | None 
     """Encode one frame as an iTerm2 inline image (OSC 1337 File)."""
     payload = base64.standard_b64encode(_png_bytes(frame)).decode("ascii")
     size = len(payload)
-    args = [f"inline=1", f"size={size}", "preserveAspectRatio=1"]
+    args = ["inline=1", f"size={size}", "preserveAspectRatio=1"]
     if cell_cols:
         args.append(f"width={cell_cols}")
     if cell_rows:

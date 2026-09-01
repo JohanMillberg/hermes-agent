@@ -10,23 +10,26 @@ import json
 import logging
 import os
 import re
-import ssl
 import time
-from email.utils import formatdate
+
 
 from agent.redact import redact_sensitive_text
+from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 # Slack conversation IDs: C (public channel), G (private/group channel), D (DM).
-# Must be uppercase alphanumeric, 9+ chars. User IDs (U...) and workspace IDs
-# (W...) are NOT valid chat.postMessage channel values — posting to them fails
-# because the API requires a conversation ID. To DM a user you must first call
-# conversations.open to obtain a D... ID. Without this gate, Slack IDs fall
-# through to channel-name resolution, which only matches by name and fails.
-_SLACK_TARGET_RE = re.compile(r"^\s*([CGDU][A-Z0-9]{8,})\s*$")
+# Must be uppercase alphanumeric, 9+ chars. User IDs (U...) are parsed as
+# explicit user targets (``user:U...``) and are converted to D... conversations
+# via conversations.open before chat.postMessage — posting directly to a U/W
+# ID fails because the API requires a conversation ID. ``@handle`` targets are
+# resolved through users.list first (``user_name:...``).
+_SLACK_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,})\s*$")
+_SLACK_USER_ID_RE = re.compile(r"^\s*(U[A-Z0-9]{8,})\s*$")
+_SLACK_USER_NAME_RE = re.compile(r"^\s*@([A-Za-z0-9._-]{1,80})\s*$")
+_SLACK_MENTION_RE = re.compile(r"^\s*<@(U[A-Z0-9]{8,})(?:\|[^>]+)?>\s*$")
 # Session-derived Slack thread targets use "<conversation_id>:<thread_ts>".
 _SLACK_THREAD_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,}):([^\s:]+)\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
@@ -40,12 +43,20 @@ _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 # downstream adapters (signal, etc.) expect.
 _PHONE_PLATFORMS = frozenset({"photon", "signal", "sms", "whatsapp"})
 _E164_TARGET_RE = re.compile(r"^\s*\+(\d{7,15})\s*$")
+# Photon DM chat GUID (mirrors _DM_CHAT_GUID_RE in the photon adapter).
+_PHOTON_DM_GUID_RE = re.compile(r"^any;-;\+\d{6,}$")
 # WhatsApp JIDs: group chats (<digits>@g.us), individual users
 # (<phone>@s.whatsapp.net), linked identities (<id>@lid), and broadcast /
 # newsletter chats. These are explicit native targets the bridge accepts
 # verbatim — they must NOT fall through to home-channel resolution.
 _WHATSAPP_JID_RE = re.compile(
     r"^\s*[\w-]+@(?:g\.us|s\.whatsapp\.net|lid|broadcast|newsletter)\s*$",
+    re.IGNORECASE,
+)
+# Buzz channels and DMs use native UUID identifiers. They are explicit
+# targets and must never substitute the configured home channel.
+_BUZZ_UUID_RE = re.compile(
+    r"^\s*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\s*$",
     re.IGNORECASE,
 )
 # Email addresses — a valid email like "user@domain.com" should be treated as
@@ -58,13 +69,75 @@ _EMAIL_TARGET_RE = re.compile(r"^\s*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2
 # never read. Map the exceptions so the error guidance is actually actionable.
 _HOME_CHANNEL_ENV_OVERRIDES = {"email": "EMAIL_HOME_ADDRESS"}
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
-_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
+_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".m2a", ".wav", ".m4a", ".flac"}
 _VOICE_EXTS = {".ogg", ".opus"}
 # Telegram's Bot API sendAudio only accepts MP3 / M4A. Other audio
 # formats either route through sendVoice (Opus/OGG) or fall back to
 # document delivery.
 _TELEGRAM_SEND_AUDIO_EXTS = {".mp3", ".m4a"}
+
+# Extensions that carry a native caption on the media bubble itself
+# (photo/video/document). Voice/audio notes are excluded: a caption on a
+# voice note reads as a separate label rather than a bubble caption, and the
+# established convention is to keep the accompanying text as its own message.
+_CAPTIONABLE_EXTS = _IMAGE_EXTS | _VIDEO_EXTS | {
+    ".pdf", ".doc", ".docx", ".txt", ".md", ".csv", ".xlsx", ".zip",
+}
+
+# Per-platform native caption length limits (characters). Text longer than
+# the limit can't ride on the media bubble and stays a separate body message.
+# Telegram's photo/video caption cap is 1024; WhatsApp and Discord are far
+# more generous, so a conservative shared ceiling keeps behavior predictable.
+_TELEGRAM_CAPTION_LIMIT = 1024
+_DEFAULT_CAPTION_LIMIT = 4096
+
+def prepare_send_message_platforms() -> None:
+    """Load enabled standalone plugins before tool schemas/cache keys are built."""
+    from hermes_cli.plugins import discover_plugins
+
+    discover_plugins()
+
+
+def _media_caption_split(text, media_files, *, max_caption_len):
+    """Decide whether the accompanying text should ride on the media bubble.
+
+    Single enforced chokepoint for the ``MEDIA:<path> caption`` behavior
+    across every standalone sender. ``hermes send`` (and the send_message
+    tool / cron) strips the ``MEDIA:`` tag and leaves the remaining prose as
+    ``text``; historically each platform sent that ``text`` as a *separate*
+    message before an uncaptioned media bubble, splitting the reported case
+    ``hermes send --to whatsapp "MEDIA:/x.png This Caption"`` into two parts.
+
+    Returns ``(caption, body_text)``:
+
+    * ``(caption, "")`` — attach ``text`` to the media as its native caption
+      and send *no* separate body message. Only when there is exactly one
+      media file, it is a captionable kind (image/video/document, not a
+      voice/audio note), and ``text`` fits ``max_caption_len``.
+    * ``(None, text)`` — keep the historical behavior: ``text`` is a separate
+      body message and the media carries no caption. Applies to multi-file
+      sends (caption→file association is ambiguous), voice/audio notes, empty
+      text, or text longer than the caption limit.
+    """
+    stripped = (text or "").strip()
+    media = media_files or []
+    if not stripped or len(media) != 1:
+        return None, text
+    media_path, is_voice = media[0]
+    if is_voice:
+        return None, text
+    ext = os.path.splitext(media_path)[1].lower()
+    if ext not in _CAPTIONABLE_EXTS:
+        return None, text
+    # Measure the caption in Unicode codepoints — a portable upper bound that
+    # never under-counts vs Telegram's UTF-16 units for BMP text, so an
+    # over-count only fails safe (falls back to a separate message). The
+    # Telegram call site additionally re-checks the *formatted* caption in
+    # UTF-16 units, since MarkdownV2/HTML escaping can inflate the length.
+    if len(stripped) > max_caption_len:
+        return None, text
+    return stripped, ""
 _URL_SECRET_QUERY_RE = re.compile(
     r"([?&](?:access_token|api[_-]?key|auth[_-]?token|token|signature|sig)=)([^&#\s]+)",
     re.IGNORECASE,
@@ -227,18 +300,16 @@ def _handle_react(args, remove=False):
     platform_name = parts[0].strip().lower()
     target_ref = parts[1].strip() if len(parts) > 1 else None
     chat_id = None
+    prepare_send_message_platforms()
     if target_ref:
-        chat_id, _thread_id, _ = _parse_target_ref(platform_name, target_ref)
-        if not chat_id:
-            try:
-                from gateway.channel_directory import resolve_channel_name
-                resolved = resolve_channel_name(platform_name, target_ref)
-            except Exception:
-                resolved = None
-            # Opaque platform-native ids (e.g. photon space GUIDs like
-            # 'any;-;+1555...') match no parser pattern and no directory
-            # entry — pass them through verbatim; the adapter validates.
-            chat_id = resolved or target_ref
+        # Platform-native ids (e.g. photon space GUIDs like 'any;-;+1555...')
+        # match no parser pattern and no directory entry, so hand them to
+        # the adapter unchanged; it validates them.
+        chat_id, _thread_id, resolution_error = resolve_send_target(
+            platform_name, target_ref, pass_unresolved_references=True
+        )
+        if resolution_error:
+            return tool_error(resolution_error)
 
     try:
         from gateway.config import Platform, load_gateway_config
@@ -308,28 +379,13 @@ def _handle_send(args):
     chat_id = None
     thread_id = None
 
+    prepare_send_message_platforms()
     if target_ref:
-        chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
-    else:
-        is_explicit = False
-
-    # Resolve human-friendly channel names to numeric IDs
-    if target_ref and not is_explicit:
-        try:
-            from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_name, target_ref)
-            if resolved:
-                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
-            else:
-                return json.dumps({
-                    "error": f"Could not resolve '{target_ref}' on {platform_name}. "
-                    f"Use send_message(action='list') to see available targets."
-                })
-        except Exception:
-            return json.dumps({
-                "error": f"Could not resolve '{target_ref}' on {platform_name}. "
-                f"Try using a numeric channel ID instead."
-            })
+        chat_id, thread_id, resolution_error = resolve_send_target(
+            platform_name, target_ref
+        )
+        if resolution_error:
+            return tool_error(resolution_error)
 
     from tools.interrupt import is_interrupted
     if is_interrupted():
@@ -341,8 +397,14 @@ def _handle_send(args):
     except Exception as e:
         return json.dumps(_error(f"Failed to load gateway config: {e}"))
 
-    # Accept any platform name — built-in names resolve to their enum
-    # member, plugin platform names create dynamic members via _missing_().
+    from gateway.platform_registry import platform_registry
+
+    entry = platform_registry.get(platform_name)
+    is_builtin = platform_name in {member.value for member in Platform}
+    if not is_builtin and entry is None:
+        return tool_error(
+            f"Unknown or unregistered plugin platform: {platform_name}"
+        )
     try:
         platform = Platform(platform_name)
     except (ValueError, KeyError):
@@ -353,8 +415,8 @@ def _handle_send(args):
         # Weixin can be configured purely via .env; synthesize a pconfig so
         # send_message and cron delivery work without a gateway.yaml entry.
         if platform_name == "weixin":
-            wx_token = os.getenv("WEIXIN_TOKEN", "").strip()
-            wx_account = os.getenv("WEIXIN_ACCOUNT_ID", "").strip()
+            wx_token = get_secret("WEIXIN_TOKEN", "").strip()
+            wx_account = get_secret("WEIXIN_ACCOUNT_ID", "").strip()
             if wx_token and wx_account:
                 from gateway.config import PlatformConfig
                 pconfig = PlatformConfig(
@@ -362,8 +424,8 @@ def _handle_send(args):
                     token=wx_token,
                     extra={
                         "account_id": wx_account,
-                        "base_url": os.getenv("WEIXIN_BASE_URL", "").strip(),
-                        "cdn_base_url": os.getenv("WEIXIN_CDN_BASE_URL", "").strip(),
+                        "base_url": get_secret("WEIXIN_BASE_URL", "").strip(),
+                        "cdn_base_url": get_secret("WEIXIN_CDN_BASE_URL", "").strip(),
                     },
                 )
             else:
@@ -398,49 +460,51 @@ def _handle_send(args):
             home_env = _HOME_CHANNEL_ENV_OVERRIDES.get(
                 platform_name, f"{platform_name.upper()}_HOME_CHANNEL"
             )
-            return json.dumps({
-                "error": f"No home channel set for {platform_name} to determine where to send the message. "
+            return tool_error(
+                f"No home channel set for {platform_name} to determine where to send the message. "
                 f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
                 f"or set a home channel via: hermes config set {home_env} <channel_id>"
-            })
+            )
 
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
-    # Slack: resolve user IDs (U...) to DM channel IDs via conversations.open
-    if platform_name == "slack" and chat_id and chat_id.startswith("U"):
-        try:
-            import aiohttp
-            async def _open_slack_dm(token, user_id):
-                url = "https://slack.com/api/conversations.open"
-                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                    async with session.post(url, headers=headers, json={"users": [user_id]}) as resp:
-                        data = await resp.json()
-                        if data.get("ok"):
-                            return data["channel"]["id"]
-                        return None
+    # Slack: resolve user targets to DM channel IDs before sending.
+    # _parse_target_ref emits internal ``user:U...`` / ``user_name:@handle``
+    # targets; a bare U... id can also arrive from session metadata or the
+    # home-channel config. All are opened via conversations.open (fixes #19236).
+    if platform_name == "slack" and chat_id:
+        _slack_dm_target = chat_id
+        if _slack_dm_target.startswith("U") and _SLACK_USER_ID_RE.fullmatch(_slack_dm_target):
+            _slack_dm_target = f"user:{_slack_dm_target}"
+        if _slack_dm_target.startswith(("user:", "user_name:")):
             from model_tools import _run_async
-            dm_channel = _run_async(_open_slack_dm(pconfig.token, chat_id))
-            if dm_channel:
-                chat_id = dm_channel
-            else:
-                return json.dumps({"error": f"Could not open DM with Slack user {chat_id}. Check bot permissions (im:write)."})
-        except Exception as e:
-            return json.dumps({"error": f"Failed to open Slack DM: {e}"})
+            _resolved, _resolve_err = _run_async(
+                _resolve_slack_user_target(pconfig.token, _slack_dm_target)
+            )
+            if _resolve_err:
+                return json.dumps(_resolve_err)
+            chat_id = _resolved
 
     try:
         from model_tools import _run_async
+        send_kwargs = {
+            "thread_id": thread_id,
+            "media_files": media_files,
+            "force_document": force_document_attachments,
+        }
+        # Preserve the exact built-in call contract; only custom handlers need
+        # the complete typed request.
+        if entry is not None and entry.send_message_handler is not None:
+            send_kwargs["args"] = args
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document_attachments,
+                **send_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -499,14 +563,13 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             return match.group(1), match.group(2), True
         match = _SLACK_TARGET_RE.fullmatch(target_ref)
         if match:
-            chat_id = match.group(1)
-            # Slack user IDs (U...) and workspace IDs (W...) are NOT valid
-            # explicit send targets — chat.postMessage rejects them. A DM
-            # must be opened first via conversations.open to get a D...
-            # conversation ID. Caller still gets the chat_id so the U→D
-            # resolution path in send_message() can run.
-            is_explicit = chat_id[0] not in {"U", "W"}
-            return chat_id, None, is_explicit
+            return match.group(1), None, True
+        match = _SLACK_USER_ID_RE.fullmatch(target_ref) or _SLACK_MENTION_RE.fullmatch(target_ref)
+        if match:
+            return f"user:{match.group(1)}", None, True
+        match = _SLACK_USER_NAME_RE.fullmatch(target_ref)
+        if match:
+            return f"user_name:{match.group(1)}", None, True
     if platform_name == "matrix":
         trimmed = target_ref.strip()
         split_idx = trimmed.rfind(":$")
@@ -537,17 +600,33 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         # through to the _PHONE_PLATFORMS handler below.
         if _WHATSAPP_JID_RE.fullmatch(target_ref):
             return target_ref.strip(), None, True
+    if platform_name == "buzz" and _BUZZ_UUID_RE.fullmatch(target_ref):
+        return target_ref.strip(), None, True
     stripped_target = target_ref.strip()
     if platform_name == "signal" and stripped_target.startswith("group:"):
         group_id = stripped_target[len("group:"):].strip()
         if group_id:
             return f"group:{group_id}", None, True
         return None, None, False
+    # WeCom: group IDs start with "wr" or "wc", user IDs start with "wo" or
+    # are bare alphanumeric strings. Treat any non-empty WeCom target_ref as
+    # an explicit chat_id — the adapter resolves whether to use APP_CMD_RESPONSE
+    # (groups) or APP_CMD_SEND (DMs) internally.
+    if platform_name == "wecom":
+        stripped = target_ref.strip()
+        if stripped:
+            return stripped, None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
             # Preserve the leading '+' — signal-cli and sms/whatsapp adapters
             # expect E.164 format for direct recipients.
+            return target_ref.strip(), None, True
+    if platform_name == "photon":
+        # Photon DM chat GUIDs ('any;-;+1555...') are platform-native ids the
+        # adapter resolves itself — pass through verbatim instead of bouncing
+        # them off the channel directory (mirrors the react handler).
+        if _PHOTON_DM_GUID_RE.fullmatch(target_ref.strip()):
             return target_ref.strip(), None, True
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
@@ -557,7 +636,146 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     # XMPP JIDs (user@server or room@conference.server) are explicit
     if platform_name == "xmpp" and "@" in target_ref:
         return target_ref, None, True
+
     return None, None, False
+
+
+def resolve_send_target(
+    platform_name: str, target_ref: str, *, pass_unresolved_references: bool = False
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve one send target the same way for every caller (model tool, CLI, cron).
+
+    Channel-directory IDs are trusted. Plugin platforms must explicitly parse
+    native target syntax; for the model-facing send tool (the default), a
+    target that can't be resolved is an error — the model can read the error
+    and pick a listed target instead.
+
+    ``pass_unresolved_references=True`` restores the old pass-through behavior for
+    callers that have no model in the loop (cron delivering a stored job's
+    output, react/unreact on platform-native message ids): if the target
+    can't be resolved and the platform is built in, or is a plugin platform
+    that declares no parser, the string is handed to the adapter exactly as
+    written and the adapter decides whether it's valid. A plugin platform
+    that DOES declare a parser stays strict for every caller — its parser is
+    the authority on native syntax.
+
+    The optional validator has the final say over parser-normalized,
+    directory-resolved, and passed-through IDs alike.
+    """
+    from gateway.config import Platform
+    from gateway.platform_registry import platform_registry
+
+    entry = platform_registry.get(platform_name)
+
+    def _validate(candidate: str) -> str | None:
+        if entry is None or entry.validate_target_ref_fn is None:
+            return None
+        try:
+            verdict = entry.validate_target_ref_fn(candidate)
+        except Exception:
+            logger.debug(
+                "Plugin target validator failed for %s", platform_name, exc_info=True
+            )
+            return f"Target validator failed for platform '{platform_name}'"
+        if verdict is True:
+            return None
+        if isinstance(verdict, str) and verdict:
+            return f"Invalid target '{target_ref}' on {platform_name}: {verdict}"
+        return f"Invalid target '{target_ref}' on {platform_name}"
+
+    if entry is not None and entry.parse_target_ref_fn is not None:
+        try:
+            parsed = entry.parse_target_ref_fn(target_ref)
+        except Exception:
+            logger.debug(
+                "Plugin target parser failed for %s", platform_name, exc_info=True
+            )
+            return None, None, f"Target parser failed for platform '{platform_name}'"
+        if parsed is not None:
+            if (
+                not isinstance(parsed, tuple)
+                or len(parsed) != 2
+                or not isinstance(parsed[0], str)
+                or not parsed[0]
+                or (parsed[1] is not None and not isinstance(parsed[1], str))
+            ):
+                return (
+                    None,
+                    None,
+                    f"Target parser for platform '{platform_name}' returned an invalid result",
+                )
+            parsed_chat_id, parsed_thread_id = parsed
+            error = _validate(parsed_chat_id)
+            return (None, None, error) if error else (
+                parsed_chat_id,
+                parsed_thread_id,
+                None,
+            )
+
+    parsed_chat_id, parsed_thread_id, explicit = _parse_target_ref(
+        platform_name, target_ref
+    )
+    if explicit and parsed_chat_id is not None:
+        error = _validate(parsed_chat_id)
+        return (None, None, error) if error else (
+            parsed_chat_id,
+            parsed_thread_id,
+            None,
+        )
+
+    resolution_failed = False
+    try:
+        from gateway.channel_directory import resolve_channel_name
+
+        resolved = resolve_channel_name(platform_name, target_ref)
+    except Exception:
+        resolved = None
+        resolution_failed = True
+    if resolved:
+        parsed_chat_id, parsed_thread_id, _ = _parse_target_ref(
+            platform_name, resolved
+        )
+        chat_id = parsed_chat_id or resolved
+        error = _validate(chat_id)
+        return (None, None, error) if error else (
+            chat_id,
+            parsed_thread_id,
+            None,
+        )
+
+    is_builtin = platform_name in {member.value for member in Platform}
+    if entry is None and not is_builtin:
+        return None, None, f"Unknown or unregistered plugin platform: {platform_name}"
+
+    def _pass_through_unresolved():
+        """Hand the raw target to the adapter unchanged (it validates)."""
+        error = _validate(target_ref)
+        if error:
+            return None, None, error
+        logger.debug(
+            "Handing unresolved target '%s' to the %s adapter unchanged "
+            "(the adapter validates it)",
+            target_ref, platform_name,
+        )
+        return target_ref, None, None
+
+    if entry is not None and entry.source == "plugin" and not is_builtin:
+        if pass_unresolved_references and entry.parse_target_ref_fn is None:
+            return _pass_through_unresolved()
+        return (
+            None,
+            None,
+            f"Could not resolve '{target_ref}' on {platform_name}. "
+            "The plugin parser did not recognize it and no channel-directory entry matched.",
+        )
+    if pass_unresolved_references:
+        return _pass_through_unresolved()
+    hint = (
+        "Try using a numeric channel ID instead."
+        if resolution_failed
+        else "Use send_message(action='list') to see available targets."
+    )
+    return None, None, f"Could not resolve '{target_ref}' on {platform_name}. {hint}"
 
 
 def _describe_media_for_mirror(media_files):
@@ -625,6 +843,106 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
+def _bounded_send_error(detail, max_chars=900):
+    """Bound untrusted adapter/plugin error detail returned by send_message."""
+    text = str(detail or "send failed")
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 3]}..."
+
+
+async def _send_live_adapter_media(
+    adapter,
+    chat_id,
+    message,
+    media_files,
+    *,
+    thread_id=None,
+    metadata=None,
+    force_document=False,
+):
+    """Deliver text and every media descriptor through adapter media APIs."""
+    caption, separate_text = _media_caption_split(
+        message, media_files, max_caption_len=_DEFAULT_CAPTION_LIMIT
+    )
+    last_result = None
+    if separate_text and separate_text.strip():
+        last_result = await adapter.send(
+            chat_id=chat_id, content=separate_text, metadata=metadata
+        )
+        if not last_result.success:
+            return {"error": f"Adapter send failed: {_bounded_send_error(last_result.error)}"}
+
+    total = len(media_files)
+    for index, descriptor in enumerate(media_files):
+        if not isinstance(descriptor, (list, tuple)) or not descriptor:
+            return {"error": f"Adapter media send failed: invalid media descriptor {index + 1}/{total}"}
+        media_path = descriptor[0]
+        is_voice = bool(descriptor[1]) if len(descriptor) > 1 else False
+        if not isinstance(media_path, str) or not media_path:
+            return {"error": f"Adapter media send failed: invalid media descriptor {index + 1}/{total}"}
+        if not os.path.exists(media_path):
+            return {"error": f"Adapter media send failed: media file {index + 1}/{total} was not found"}
+
+        ext = os.path.splitext(media_path)[1].lower()
+        kwargs = {
+            "caption": caption if index == 0 else None,
+            "reply_to": thread_id,
+            "metadata": metadata,
+        }
+        if force_document:
+            method_name = "send_document"
+            media_kind = "document"
+        elif ext in _IMAGE_EXTS:
+            method_name = "send_image_file"
+            media_kind = "image"
+        elif ext in _VIDEO_EXTS:
+            method_name = "send_video"
+            media_kind = "video"
+        elif is_voice or ext in _AUDIO_EXTS:
+            method_name = "send_voice"
+            media_kind = "audio"
+        else:
+            method_name = "send_document"
+            media_kind = "document"
+
+        from gateway.platforms.base import BasePlatformAdapter
+
+        adapter_method = getattr(type(adapter), method_name, None)
+        base_fallback = getattr(BasePlatformAdapter, method_name)
+        if adapter_method is None or adapter_method is base_fallback:
+            return {
+                "error": (
+                    f"Live adapter does not implement native {media_kind} delivery; "
+                    f"media file {index + 1}/{total} was not sent"
+                )
+            }
+        try:
+            last_result = await getattr(adapter, method_name)(chat_id, media_path, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return {
+                "error": (
+                    f"Adapter media send failed after {index}/{total} files: "
+                    f"{_bounded_send_error(exc)}"
+                )
+            }
+        if not last_result.success:
+            detail = _bounded_send_error(last_result.error or "media send failed")
+            return {
+                "error": f"Adapter media send failed after {index}/{total} files: {detail}"
+            }
+
+    if last_result is None:
+        return {"error": "No deliverable text or media remained after processing MEDIA tags"}
+    return {
+        "success": True,
+        "message_id": last_result.message_id,
+        "media_delivered": True,
+    }
+
+
 async def _send_via_adapter(
     platform,
     pconfig,
@@ -668,14 +986,83 @@ async def _send_via_adapter(
                     metadata["publish_topic"] = chat_id
                 if not metadata:
                     metadata = None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                # The adapter's send() uses asyncio.Queue + worker tasks bound
+                # to the gateway's main event loop.  Calling send() from a
+                # different thread/loop (the agent's tool worker thread) causes
+                # a cross-loop Future deadlock: the worker loop's selector never
+                # gets woken when the gateway loop resolves the future.
+                # When on a different loop, dispatch onto the gateway loop via
+                # run_coroutine_threadsafe and await the wrapped future.
+                gateway_loop = getattr(runner, "_gateway_loop", None)
+                try:
+                    _current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    _current_loop = None
+
+                _need_cross_loop = (
+                    gateway_loop is not None
+                    and _current_loop is not gateway_loop
+                )
+
+                # Media descriptors route through the adapter's native media
+                # APIs (same cross-loop rules apply — the media helper awaits
+                # adapter methods bound to the gateway loop).
+                if media_files:
+                    def _media_coro():
+                        return _send_live_adapter_media(
+                            adapter,
+                            chat_id,
+                            chunk,
+                            media_files,
+                            thread_id=thread_id,
+                            metadata=metadata,
+                            force_document=force_document,
+                        )
+                    if _need_cross_loop:
+                        if not gateway_loop.is_running():
+                            return {"error": "Gateway loop is not running; cannot dispatch adapter send"}
+                        from agent.async_utils import safe_schedule_threadsafe
+                        media_fut = safe_schedule_threadsafe(
+                            _media_coro(),
+                            gateway_loop,
+                            logger=logger,
+                            log_message="send_message: failed to schedule media send on gateway loop",
+                        )
+                        if media_fut is None:
+                            return {"error": "Gateway loop unavailable for send dispatch"}
+                        return await asyncio.shield(asyncio.wrap_future(media_fut))
+                    return await _media_coro()
+
+                if _need_cross_loop:
+                    if not gateway_loop.is_running():
+                        return {"error": "Gateway loop is not running; cannot dispatch adapter send"}
+                    from agent.async_utils import safe_schedule_threadsafe
+                    fut = safe_schedule_threadsafe(
+                        adapter.send(chat_id=chat_id, content=chunk, metadata=metadata),
+                        gateway_loop,
+                        logger=logger,
+                        log_message="send_message: failed to schedule on gateway loop",
+                    )
+                    if fut is None:
+                        return {"error": "Gateway loop unavailable for send dispatch"}
+                    # Use shield so that if the caller's task is cancelled (e.g.
+                    # agent interrupt), the already-enqueued send on the gateway
+                    # loop is NOT cancelled — preventing "tool failed but message
+                    # still sent later" followed by agent retry causing duplicates.
+                    # No explicit timeout here: the adapter's internal request
+                    # timeout (15s) and the upper-layer _run_async 300s timeout
+                    # provide sufficient protection against hangs.
+                    result = await asyncio.shield(asyncio.wrap_future(fut))
+                else:
+                    # Same loop or no gateway loop (CLI, tests) — direct await.
+                    result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                return {"error": f"Plugin platform send failed: {e}"}
+                return {"error": f"Plugin platform send failed: {_bounded_send_error(e)}"}
             if result.success:
                 return {"success": True, "message_id": result.message_id}
-            return {"error": f"Adapter send failed: {result.error}"}
+            return {"error": f"Adapter send failed: {_bounded_send_error(result.error)}"}
 
     entry = None
     try:
@@ -698,9 +1085,11 @@ async def _send_via_adapter(
             raise
         except Exception as e:
             logger.debug("Plugin standalone send for %s raised", platform_name, exc_info=True)
-            return {"error": f"Plugin standalone send failed: {e}"}
+            return {"error": f"Plugin standalone send failed: {_bounded_send_error(e)}"}
 
         if isinstance(result, dict) and (result.get("success") or result.get("error")):
+            if result.get("error"):
+                return {**result, "error": _bounded_send_error(result["error"])}
             return result
         return {
             "error": (
@@ -720,7 +1109,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -728,6 +1117,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     (preserves code-block boundaries, adds part indicators).
     """
     from gateway.config import Platform
+
+    platform_name = platform.value if hasattr(platform, "value") else str(platform)
 
     media_files = media_files or []
 
@@ -763,6 +1154,18 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     _MAX_LENGTHS = {
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH if _telegram_available else 4096,
     }
+
+    # Signal's standalone path (_send_signal) speaks raw JSON-RPC and does not
+    # go through SignalAdapter.send(), so it never benefits from the adapter's
+    # native chunking. Register the platform limit here so the shared
+    # truncate_message() pass below splits long sends instead of signal-cli
+    # rejecting them. Sourced from the adapter module so the two paths can't
+    # drift (credit: @5L-hermes01 in #67279, @lkz-de in #57929).
+    try:
+        from gateway.platforms.signal import MAX_MESSAGE_LENGTH as _SIGNAL_MAX
+        _MAX_LENGTHS[Platform.SIGNAL] = _SIGNAL_MAX
+    except ImportError:
+        _MAX_LENGTHS[Platform.SIGNAL] = 8000
 
     # Check plugin registry for max_message_length
     if platform not in _MAX_LENGTHS:
@@ -814,6 +1217,26 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         entry = platform_registry.get("discord")
         if entry is None or entry.standalone_sender_fn is None:
             return {"error": "Discord plugin not registered or missing standalone_sender_fn"}
+        # MEDIA:<path> caption: single captionable file + short text rides as
+        # the media message content instead of a separate message before the
+        # attachment (single enforced decision in _media_caption_split). Cap on
+        # the platform's own message limit so the caption is always deliverable.
+        _dc_caption, _ = _media_caption_split(
+            message, media_files,
+            max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
+        )
+        if _dc_caption is not None:
+            result = await entry.standalone_sender_fn(
+                pconfig,
+                chat_id,
+                "",
+                thread_id=thread_id,
+                media_files=media_files,
+                caption=_dc_caption,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            return result
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
@@ -905,6 +1328,48 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Slack: native media via files_upload_v2 in the plugin's
+    # standalone_sender_fn (plugins/platforms/slack/adapter.py::_standalone_send).
+    # Gateway in-channel MEDIA: delivery already worked; send_message previously
+    # omitted Slack attachments and told the model media was unsupported.
+    if platform == Platform.SLACK and media_files:
+        from gateway.platform_registry import platform_registry as _pr_slack
+        from hermes_cli.plugins import discover_plugins as _dp_slack
+        _dp_slack()
+        _slack_entry = _pr_slack.get("slack")
+        if _slack_entry is None or _slack_entry.standalone_sender_fn is None:
+            return {"error": "Slack plugin not registered or missing standalone_sender_fn"}
+        _sl_caption, _ = _media_caption_split(
+            message, media_files,
+            max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
+        )
+        if _sl_caption is not None:
+            result = await _slack_entry.standalone_sender_fn(
+                pconfig,
+                chat_id,
+                "",
+                thread_id=thread_id,
+                media_files=media_files,
+                caption=_sl_caption,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            return result
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _slack_entry.standalone_sender_fn(
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else [],
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- WhatsApp: native media attachment support via the registry's
     # standalone_sender_fn (plugins/platforms/whatsapp/adapter.py::_standalone_send).
     # The plugin uploads each file through the local Baileys bridge /send-media
@@ -916,7 +1381,30 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         _wa_entry = _pr_wa.get("whatsapp")
         if _wa_entry is None or _wa_entry.standalone_sender_fn is None:
             return {"error": "WhatsApp plugin not registered or missing standalone_sender_fn"}
+        # MEDIA:<path> caption: a single captionable file + short text rides
+        # as the media's native caption instead of a separate message before
+        # the bubble (single enforced decision in _media_caption_split). Cap on
+        # the platform's own message limit so the caption is always deliverable.
+        _wa_caption, _ = _media_caption_split(
+            message, media_files,
+            max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
+        )
         last_result = None
+        if _wa_caption is not None:
+            # Single-file captioned send: no separate text chunk, caption on
+            # the media itself.
+            result = await _wa_entry.standalone_sender_fn(
+                pconfig,
+                chat_id,
+                "",
+                media_files=media_files,
+                thread_id=thread_id,
+                force_document=force_document,
+                caption=_wa_caption,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            return result
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             result = await _wa_entry.standalone_sender_fn(
@@ -932,36 +1420,71 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Slack: prefer the live gateway adapter, then the plugin's
+    # standalone sender.  The live adapter is multi-workspace aware (it maps
+    # channels to the workspace client that owns them) and honors adapter-side
+    # gates like ignored_channels; the standalone Web-API path may only have a
+    # comma-separated token list.  ``_send_via_adapter`` tries the in-process
+    # adapter first and falls back to the registry standalone sender for
+    # out-of-process cron runs, preserving MEDIA delivery on the fallback
+    # (media-bearing sends were already intercepted by the branch above).
+    if platform == Platform.SLACK:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = i == len(chunks) - 1
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else [],
+                force_document=force_document,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
+    # --- WeCom: native media attachment support via live gateway adapter ---
+    if platform == Platform.WECOM and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else None,
+                force_document=force_document,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
-    if media_files and not message.strip():
+    # Buzz is a plugin platform with verified native media delivery through
+    # _send_via_adapter below, including valid media-only sends.
+    if media_files and not message.strip() and platform.value != "buzz":
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and whatsapp; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack; "
                 f"target {platform.value} had only media attachments"
             )
         }
     warning = None
-    if media_files:
+    if media_files and platform.value != "buzz":
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and whatsapp"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
         )
 
     last_result = None
-    for chunk in chunks:
-        if platform == Platform.SLACK:
-            # Slack migrated to a bundled plugin (#41112); delivery flows
-            # through the registry's standalone_sender_fn, which applies
-            # mrkdwn formatting and posts via the Slack Web API.
-            from gateway.platform_registry import platform_registry
-            _slack_entry = platform_registry.get("slack")
-            if _slack_entry is None or _slack_entry.standalone_sender_fn is None:
-                result = {"error": "Slack plugin not registered or missing standalone_sender_fn"}
-            else:
-                result = await _slack_entry.standalone_sender_fn(
-                    pconfig, chat_id, chunk, thread_id=thread_id
-                )
-        elif platform == Platform.WHATSAPP:
+    for i, chunk in enumerate(chunks):
+        if platform == Platform.WHATSAPP:
             result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
@@ -982,6 +1505,20 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.YUANBAO:
             result = await _send_yuanbao(chat_id, chunk)
         else:
+            from gateway.platform_registry import platform_registry
+
+            entry = platform_registry.get(platform_name)
+            handler = entry.send_message_handler if entry is not None else None
+            if handler is not None:
+                try:
+                    import inspect
+
+                    result = handler(args or {}, chat_id, platform_name, pconfig)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    return result
+                except Exception as e:
+                    return {"error": f"Plugin send_message handler failed: {e}"}
             # Plugin platform: route through the gateway's live adapter if
             # available, otherwise the plugin's standalone_sender_fn.
             result = await _send_via_adapter(
@@ -990,7 +1527,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chat_id,
                 chunk,
                 thread_id=thread_id,
-                media_files=media_files,
+                media_files=media_files if i == len(chunks) - 1 else [],
                 force_document=force_document,
             )
 
@@ -998,7 +1535,12 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             return result
         last_result = result
 
-    if warning and isinstance(last_result, dict) and last_result.get("success"):
+    if (
+        warning
+        and isinstance(last_result, dict)
+        and last_result.get("success")
+        and not last_result.get("media_delivered")
+    ):
         warnings = list(last_result.get("warnings", []))
         warnings.append(warning)
         last_result["warnings"] = warnings
@@ -1109,6 +1651,23 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         last_msg = None
         warnings = []
 
+        # MEDIA:<path> caption: when a single captionable file is accompanied
+        # by short text, attach the text to the media bubble as its native
+        # caption instead of sending it as a separate message beforehand
+        # (single enforced decision in _media_caption_split). Caption with the
+        # *formatted* text so MarkdownV2/HTML styling is preserved, but guard
+        # the formatted length against Telegram's 1024 cap — formatting can
+        # inflate a raw-<1024 string past it, in which case fall back to a
+        # separate body message.
+        _tg_caption = None
+        from gateway.platforms.base import utf16_len as _utf16_len
+        _cap, _ = _media_caption_split(
+            message, media_files, max_caption_len=_TELEGRAM_CAPTION_LIMIT
+        )
+        if _cap is not None and _utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
+            _tg_caption = formatted
+            formatted = ""  # suppress the separate text send below
+
         if formatted.strip():
             # Chunk *after* formatting: MarkdownV2/HTML escaping inflates the
             # text (each escaped char like `!`/`.`/`-` becomes `\!`/`\.`/`\-`),
@@ -1170,12 +1729,42 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 warning = f"Media file not found, skipping: {media_path}"
                 logger.warning(warning)
                 warnings.append(warning)
+                # Caption mode suppressed the separate text send; if the file
+                # it was meant to caption is gone, deliver the caption text on
+                # its own so the words aren't silently lost.
+                if _tg_caption is not None and last_msg is None:
+                    try:
+                        last_msg = await _send_telegram_message_with_retry(
+                            bot, chat_id=int_chat_id, text=_tg_caption,
+                            parse_mode=send_parse_mode, **text_kwargs
+                        )
+                        _tg_caption = None  # delivered — don't re-caption a later file
+                    except Exception as _cap_err:
+                        logger.warning(
+                            "Telegram caption-fallback send failed for missing media: %s",
+                            _sanitize_error_text(_cap_err),
+                        )
                 continue
 
             ext = os.path.splitext(media_path)[1].lower()
             try:
                 with open(media_path, "rb") as f:
                     media_kwargs = dict(thread_kwargs)
+                    # Attach the MEDIA:<path> caption to the bubble itself for
+                    # captionable kinds (photo/video/document). _tg_caption is
+                    # only set for a single captionable file, so this never
+                    # double-captions a multi-file send or a voice note.
+                    if _tg_caption is not None and not (ext in _VOICE_EXTS and is_voice):
+                        media_kwargs["caption"] = _tg_caption
+                        media_kwargs["parse_mode"] = send_parse_mode
+                    if (ext in _VOICE_EXTS and is_voice) or ext in _TELEGRAM_SEND_AUDIO_EXTS:
+                        try:
+                            from plugins.platforms.telegram.adapter import _probe_voice_duration_seconds
+                            duration = await asyncio.to_thread(_probe_voice_duration_seconds, media_path)
+                            if duration is not None:
+                                media_kwargs["duration"] = duration
+                        except Exception:
+                            pass
                     try:
                         if ext in _IMAGE_EXTS and not force_document:
                             last_msg = await bot.send_photo(
@@ -1223,6 +1812,37 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
                                 last_msg = await bot.send_audio(
                                     chat_id=int_chat_id, audio=f, **media_kwargs
+                                )
+                            else:
+                                last_msg = await bot.send_document(
+                                    chat_id=int_chat_id, document=f, **media_kwargs
+                                )
+                        elif media_kwargs.get("parse_mode") and (
+                            "parse" in str(media_err).lower()
+                            or "caption" in str(media_err).lower()
+                        ):
+                            # Caption failed to parse as MarkdownV2/HTML —
+                            # retry with a plain-text caption so the media
+                            # (and its caption) still deliver.
+                            logger.warning(
+                                "Caption parse failed for media send, retrying plain: %s",
+                                _sanitize_error_text(media_err),
+                            )
+                            f.seek(0)
+                            media_kwargs.pop("parse_mode", None)
+                            if not _has_html and media_kwargs.get("caption"):
+                                try:
+                                    from plugins.platforms.telegram.adapter import _strip_mdv2
+                                    media_kwargs["caption"] = _strip_mdv2(media_kwargs["caption"])
+                                except Exception:
+                                    pass
+                            if ext in _IMAGE_EXTS and not force_document:
+                                last_msg = await bot.send_photo(
+                                    chat_id=int_chat_id, photo=f, **media_kwargs
+                                )
+                            elif ext in _VIDEO_EXTS:
+                                last_msg = await bot.send_video(
+                                    chat_id=int_chat_id, video=f, **media_kwargs
                                 )
                             else:
                                 last_msg = await bot.send_document(
@@ -1278,6 +1898,84 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
 
 # _send_whatsapp moved to plugins/platforms/whatsapp/adapter.py::_standalone_send,
 # wired via standalone_sender_fn and reached through _registry_standalone_send. #41112.
+
+
+async def _resolve_slack_user_target(token, chat_id):
+    """Resolve a Slack user target to a D... DM conversation ID.
+
+    ``chat_id`` may be a Slack conversation ID (C/G/D...) — returned unchanged —
+    or an internal user target (``user:U...`` / ``user_name:<handle>``). User
+    targets are opened as DMs via conversations.open because Slack
+    chat.postMessage requires a conversation ID. ``user_name:`` targets are
+    first resolved to a user ID through users.list (stable handle match only).
+
+    Returns ``(chat_id, None)`` on success or ``(None, error_dict)`` on failure.
+    """
+    if not (chat_id.startswith("user:") or chat_id.startswith("user_name:")):
+        return chat_id, None
+    try:
+        import aiohttp
+    except ImportError:
+        return None, {"error": "aiohttp not installed. Run: pip install aiohttp"}
+    try:
+        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+        _proxy = resolve_proxy_url()
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        base_url = "https://slack.com/api"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        async def post_api(session, method, payload):
+            async with session.post(f"{base_url}/{method}", headers=headers, json=payload, **_req_kw) as resp:
+                return await resp.json()
+
+        async def resolve_user_name(session, name):
+            query = name.strip().lstrip("@").lower()
+            matches = []
+            cursor = None
+            for _page in range(20):
+                payload = {"limit": 200}
+                if cursor:
+                    payload["cursor"] = cursor
+                data = await post_api(session, "users.list", payload)
+                if not data.get("ok"):
+                    return None, f"Slack users.list error: {data.get('error', 'unknown')}"
+                for member in data.get("members", []):
+                    if member.get("deleted") or member.get("is_bot"):
+                        continue
+                    # ``@name`` should match the stable Slack handle only. Display
+                    # and real names are mutable/non-unique enough that using them
+                    # could DM the wrong person with sensitive content.
+                    if str(member.get("name", "")).strip().lower() == query:
+                        matches.append(member)
+                cursor = (data.get("response_metadata") or {}).get("next_cursor")
+                if not cursor:
+                    break
+            if not matches:
+                return None, f"Could not resolve Slack user '@{name}'."
+            if len(matches) > 1:
+                return None, f"Slack user '@{name}' matched multiple Slack users. Use a Slack user ID instead."
+            return matches[0].get("id"), None
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+            if chat_id.startswith("user_name:"):
+                user_id, error = await resolve_user_name(session, chat_id[len("user_name:"):])
+                if error:
+                    return None, _error(error)
+                chat_id = f"user:{user_id}"
+
+            user_id = chat_id[len("user:"):]
+            opened = await post_api(session, "conversations.open", {"users": user_id})
+            if not opened.get("ok"):
+                return None, _error(
+                    f"Slack conversations.open error: {opened.get('error', 'unknown')}. "
+                    "Check bot permissions (im:write)."
+                )
+            dm_id = (opened.get("channel") or {}).get("id")
+            if not dm_id:
+                return None, _error("Slack conversations.open did not return a DM channel ID")
+            return dm_id, None
+    except Exception as e:
+        return None, _error(f"Slack DM resolution failed: {e}")
 
 
 async def _send_signal(extra, chat_id, message, media_files=None):
@@ -1691,10 +2389,15 @@ async def _send_qqbot(pconfig, chat_id, message):
     except ImportError:
         return _error("QQBot direct send requires httpx. Run: pip install httpx")
 
+    # Resolve credential fallbacks through the profile secret scope (with the
+    # plain-environ fallback for unscoped single-profile runs) so a multiplex
+    # profile's direct send never borrows another profile's QQ credentials.
+    from gateway.config import _getenv
+
     extra = pconfig.extra or {}
-    appid = extra.get("app_id") or os.getenv("QQ_APP_ID", "")
+    appid = extra.get("app_id") or _getenv("QQ_APP_ID", "")
     secret = (pconfig.token or extra.get("client_secret")
-              or os.getenv("QQ_CLIENT_SECRET", ""))
+              or _getenv("QQ_CLIENT_SECRET", ""))
     if not appid or not secret:
         return _error("QQBot: QQ_APP_ID / QQ_CLIENT_SECRET not configured.")
 
@@ -1710,7 +2413,7 @@ async def _send_qqbot(pconfig, chat_id, message):
             token_data = token_resp.json()
             access_token = token_data.get("access_token")
             if not access_token:
-                return _error(f"QQBot: no access_token in response")
+                return _error("QQBot: no access_token in response")
 
             # Step 2: Send message via REST
             # QQ Bot API has separate endpoints for channels, C2C, and groups.

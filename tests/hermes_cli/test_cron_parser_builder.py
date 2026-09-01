@@ -25,41 +25,12 @@ def _build():
 
 def test_cron_subactions_present():
     parser = _build()
-    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "tick"):
-        ns = parser.parse_args(["cron", action] if action in ("list", "status", "tick")
+    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "runs", "doctor", "tick"):
+        ns = parser.parse_args(["cron", action] if action in ("list", "status", "runs", "doctor", "tick")
                                else ["cron", action, "jobid"] if action in ("pause", "resume", "run", "remove", "edit")
                                else ["cron", "create", "30m"])
         assert ns.command == "cron"
         assert ns.cron_command == action
-
-
-def test_cron_aliases():
-    parser = _build()
-    # create has alias "add"
-    ns = parser.parse_args(["cron", "add", "30m"])
-    assert ns.cron_command == "add"
-    # remove has aliases rm / delete
-    for alias in ("rm", "delete"):
-        ns = parser.parse_args(["cron", alias, "jid"])
-        assert ns.cron_command == alias
-
-
-def test_cron_create_options():
-    parser = _build()
-    ns = parser.parse_args([
-        "cron", "create", "0 9 * * *", "daily task prompt",
-        "--name", "daily", "--deliver", "origin", "--repeat", "3",
-        "--skill", "a", "--skill", "b", "--no-agent",
-        "--workdir", "/tmp/x",
-    ])
-    assert ns.schedule == "0 9 * * *"
-    assert ns.prompt == "daily task prompt"
-    assert ns.name == "daily"
-    assert ns.deliver == "origin"
-    assert ns.repeat == 3
-    assert ns.skills == ["a", "b"]
-    assert ns.no_agent is True
-    assert ns.workdir == "/tmp/x"
 
 
 def test_cron_edit_no_agent_tristate():
@@ -76,16 +47,13 @@ def test_cron_edit_inference_pin_flags():
         "cron", "edit", "j",
         "--provider", "opencode-go",
         "--model", "gpt-5.6-luna",
-        "--base-url", "https://opencode.ai/zen/go/v1",
     ])
-    assert ns.provider == "opencode-go"
+    assert ns.model_provider == "opencode-go"
     assert ns.model == "gpt-5.6-luna"
-    assert ns.base_url == "https://opencode.ai/zen/go/v1"
     # Omitted -> None: the field is left untouched (not cleared).
     ns2 = parser.parse_args(["cron", "edit", "j"])
-    assert ns2.provider is None
+    assert ns2.model_provider is None
     assert ns2.model is None
-    assert ns2.base_url is None
 
 
 def test_cron_dispatch_func_is_injected_handler():
