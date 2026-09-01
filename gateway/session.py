@@ -1121,8 +1121,6 @@ def build_session_key(
         participants — user_id is NOT appended, so every user in the thread
         shares a single session.  This is the expected UX for threaded
         conversations (Telegram forum topics, Slack threads).
-      - Discord is stricter: server/channel/thread sessions always append
-        user_id when available, regardless of the group/thread sharing flags.
       - Without participant identifiers, or when isolation is disabled, messages fall back to one
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.

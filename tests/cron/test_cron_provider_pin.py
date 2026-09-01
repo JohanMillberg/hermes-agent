@@ -173,27 +173,6 @@ class TestProviderDriftGuard:
         assert agent_constructed is True
 
 
-    def test_explicit_opt_out_allows_provider_and_model_drift(self, tmp_path):
-        """The opt-out lets large unpinned fleets track changing defaults."""
-        job = _base_job(
-            provider_snapshot="old-provider",
-            model_snapshot="old-model",
-        )
-        success, output, final_response, error, agent_constructed = \
-            _run_with_current_provider_and_model(
-                job,
-                "new-provider",
-                "new-model",
-                tmp_path,
-                model_drift_guard=False,
-            )
-
-        assert agent_constructed is True
-        assert success is True
-        assert final_response == "ok"
-        assert error is None
-
-
 
 class TestCreateJobSnapshot:
     """create_job captures provider_snapshot for unpinned agent jobs only."""
@@ -356,6 +335,27 @@ class TestModelDriftGuard:
             )
         assert agent_constructed is True
         assert success is True
+
+
+    def test_explicit_opt_out_allows_provider_and_model_drift(self, tmp_path):
+        """The opt-out lets large unpinned fleets track changing defaults."""
+        job = _base_job(
+            provider_snapshot="old-provider",
+            model_snapshot="old-model",
+        )
+        success, output, final_response, error, agent_constructed = \
+            _run_with_current_provider_and_model(
+                job,
+                "new-provider",
+                "new-model",
+                tmp_path,
+                model_drift_guard=False,
+            )
+
+        assert agent_constructed is True
+        assert success is True
+        assert final_response == "ok"
+        assert error is None
 
 
 class TestDeadProviderSelfHeal:
